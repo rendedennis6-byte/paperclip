@@ -710,7 +710,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         .find(Boolean) ?? "";
 
     if ((proc.exitCode ?? 0) === 0) {
-      return "Failed to parse claude JSON output";
+      // Include the first non-empty stdout line for diagnostics (e.g. usage-limit messages
+      // that Claude prints as plain text and exits 0 without producing stream-JSON).
+      const stdoutLine =
+        proc.stdout
+          .split(/\r?\n/)
+          .map((line) => line.replace(/(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "").trim())
+          .find(Boolean) ?? "";
+      return stdoutLine
+        ? `Failed to parse claude JSON output: ${stdoutLine.slice(0, 200)}`
+        : "Failed to parse claude JSON output";
     }
 
     return stderrLine
@@ -803,9 +812,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
+      // Check for transient upstream errors regardless of exit code: Claude sometimes
+      // exits 0 when printing a usage-limit message without emitting stream-JSON output.
       const transientUpstream =
         !loginMeta.requiresLogin &&
-        (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError({
           parsed: null,
           stdout: proc.stdout,
