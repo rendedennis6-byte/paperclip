@@ -10,6 +10,7 @@ import {
   projects,
 } from "@paperclipai/db";
 import type {
+  AgentCostClass,
   BudgetIncident,
   BudgetIncidentResolutionInput,
   BudgetMetric,
@@ -66,9 +67,11 @@ function budgetStatusFromObserved(
   observedAmount: number,
   amount: number,
   warnPercent: number,
+  warnHighPercent?: number,
 ): BudgetPolicySummary["status"] {
   if (amount <= 0) return "ok";
   if (observedAmount >= amount) return "hard_stop";
+  if (warnHighPercent != null && observedAmount >= Math.ceil((amount * warnHighPercent) / 100)) return "warn_high";
   if (observedAmount >= Math.ceil((amount * warnPercent) / 100)) return "warning";
   return "ok";
 }
@@ -333,11 +336,14 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       remainingAmount: amount > 0 ? Math.max(0, amount - observedAmount) : 0,
       utilizationPercent,
       warnPercent: policy.warnPercent,
+      warnHighPercent: policy.warnHighPercent ?? 85,
+      warnRecoveryPercent: policy.warnRecoveryPercent ?? 55,
+      warnHighRecoveryPercent: policy.warnHighRecoveryPercent ?? 75,
       hardStopEnabled: policy.hardStopEnabled,
       notifyEnabled: policy.notifyEnabled,
       isActive: policy.isActive,
       status: policy.isActive
-        ? budgetStatusFromObserved(observedAmount, amount, policy.warnPercent)
+        ? budgetStatusFromObserved(observedAmount, amount, policy.warnPercent, policy.warnHighPercent ?? undefined)
         : "ok",
       paused: scope.paused,
       pauseReason: scope.pauseReason,
@@ -538,6 +544,9 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           .set({
             amount,
             warnPercent: input.warnPercent ?? existing.warnPercent,
+            warnHighPercent: input.warnHighPercent ?? existing.warnHighPercent,
+            warnRecoveryPercent: input.warnRecoveryPercent ?? existing.warnRecoveryPercent,
+            warnHighRecoveryPercent: input.warnHighRecoveryPercent ?? existing.warnHighRecoveryPercent,
             hardStopEnabled: input.hardStopEnabled ?? existing.hardStopEnabled,
             notifyEnabled: input.notifyEnabled ?? existing.notifyEnabled,
             isActive: nextIsActive,
@@ -556,7 +565,10 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             metric,
             windowKind,
             amount,
-            warnPercent: input.warnPercent ?? 80,
+            warnPercent: input.warnPercent ?? 60,
+            warnHighPercent: input.warnHighPercent ?? 85,
+            warnRecoveryPercent: input.warnRecoveryPercent ?? 55,
+            warnHighRecoveryPercent: input.warnHighRecoveryPercent ?? 75,
             hardStopEnabled: input.hardStopEnabled ?? true,
             notifyEnabled: input.notifyEnabled ?? true,
             isActive: nextIsActive,
@@ -724,11 +736,14 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           pauseReason: agents.pauseReason,
           companyId: agents.companyId,
           name: agents.name,
+          costClass: agents.costClass,
         })
         .from(agents)
         .where(eq(agents.id, agentId))
         .then((rows) => rows[0] ?? null);
       if (!agent || agent.companyId !== companyId) throw notFound("Agent not found");
+
+      const costClass = (agent.costClass ?? "metered") as AgentCostClass;
 
       const company = await db
         .select({
@@ -745,6 +760,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           scopeType: "company" as const,
           scopeId: companyId,
           scopeName: company.name,
+          stage: "hard_stop" as const,
           reason:
             company.pauseReason === "budget"
               ? "Company is paused because its budget hard-stop was reached."
@@ -772,42 +788,80 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             scopeType: "company" as const,
             scopeId: companyId,
             scopeName: company.name,
+            stage: "hard_stop" as const,
             reason: "Company cannot start new work because its budget hard-stop is exceeded.",
           };
         }
       }
 
-      if (agent.status === "paused" && agent.pauseReason === "budget") {
-        return {
-          scopeType: "agent" as const,
-          scopeId: agentId,
-          scopeName: agent.name,
-          reason: "Agent is paused because its budget hard-stop was reached.",
-        };
-      }
-
-      const agentPolicy = await db
-        .select()
-        .from(budgetPolicies)
-        .where(
-          and(
-            eq(budgetPolicies.companyId, companyId),
-            eq(budgetPolicies.scopeType, "agent"),
-            eq(budgetPolicies.scopeId, agentId),
-            eq(budgetPolicies.isActive, true),
-            eq(budgetPolicies.metric, "billed_cents"),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (agentPolicy && agentPolicy.hardStopEnabled && agentPolicy.amount > 0) {
-        const observed = await computeObservedAmount(db, agentPolicy);
-        if (observed >= agentPolicy.amount) {
+      // critical agents bypass agent-level budget throttle entirely
+      if (costClass !== "critical") {
+        if (agent.status === "paused" && agent.pauseReason === "budget") {
           return {
             scopeType: "agent" as const,
             scopeId: agentId,
             scopeName: agent.name,
-            reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+            stage: "hard_stop" as const,
+            reason: "Agent is paused because its budget hard-stop was reached.",
           };
+        }
+
+        const agentPolicy = await db
+          .select()
+          .from(budgetPolicies)
+          .where(
+            and(
+              eq(budgetPolicies.companyId, companyId),
+              eq(budgetPolicies.scopeType, "agent"),
+              eq(budgetPolicies.scopeId, agentId),
+              eq(budgetPolicies.isActive, true),
+              eq(budgetPolicies.metric, "billed_cents"),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+
+        if (agentPolicy && agentPolicy.hardStopEnabled && agentPolicy.amount > 0) {
+          const observed = await computeObservedAmount(db, agentPolicy);
+          const hardStopThreshold = agentPolicy.amount;
+
+          if (observed >= hardStopThreshold) {
+            return {
+              scopeType: "agent" as const,
+              scopeId: agentId,
+              scopeName: agent.name,
+              stage: "hard_stop" as const,
+              reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+            };
+          }
+
+          // metered agents get graduated warn/warn_high throttle stages before hard stop
+          if (costClass === "metered") {
+            const warnHighThreshold = Math.ceil(
+              (agentPolicy.amount * (agentPolicy.warnHighPercent ?? 85)) / 100,
+            );
+            const warnThreshold = Math.ceil(
+              (agentPolicy.amount * (agentPolicy.warnPercent ?? 60)) / 100,
+            );
+
+            if (observed >= warnHighThreshold) {
+              return {
+                scopeType: "agent" as const,
+                scopeId: agentId,
+                scopeName: agent.name,
+                stage: "warn_high" as const,
+                reason: `Agent has reached ${agentPolicy.warnHighPercent ?? 85}% of its monthly budget and is being throttled.`,
+              };
+            }
+            if (observed >= warnThreshold) {
+              return {
+                scopeType: "agent" as const,
+                scopeId: agentId,
+                scopeName: agent.name,
+                stage: "warn" as const,
+                reason: `Agent has reached ${agentPolicy.warnPercent ?? 60}% of its monthly budget.`,
+              };
+            }
+          }
         }
       }
 
@@ -847,6 +901,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             scopeType: "project" as const,
             scopeId: project.id,
             scopeName: project.name,
+            stage: "hard_stop" as const,
             reason: "Project cannot start work because its budget hard-stop is still exceeded.",
           };
         }
@@ -857,6 +912,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         scopeType: "project" as const,
         scopeId: project.id,
         scopeName: project.name,
+        stage: "hard_stop" as const,
         reason: "Project is paused because its budget hard-stop was reached.",
       };
     },

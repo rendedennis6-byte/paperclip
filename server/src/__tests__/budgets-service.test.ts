@@ -189,6 +189,7 @@ describe("budgetService", () => {
       scopeType: "agent",
       scopeId: "agent-1",
       scopeName: "Budget Agent",
+      stage: "hard_stop",
       reason: "Agent cannot start because its budget hard-stop is still exceeded.",
     });
   });
@@ -215,6 +216,7 @@ describe("budgetService", () => {
       scopeType: "company",
       scopeId: "company-1",
       scopeName: "Paperclip",
+      stage: "hard_stop",
       reason: "Company is paused because its budget hard-stop was reached.",
     });
   });

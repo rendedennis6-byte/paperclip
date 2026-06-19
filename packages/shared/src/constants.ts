@@ -55,6 +55,7 @@ export const AGENT_ROLES = [
   "devops",
   "researcher",
   "general",
+  "routing-agent",
 ] as const;
 export type AgentRole = (typeof AGENT_ROLES)[number];
 
@@ -71,7 +72,11 @@ export const AGENT_ROLE_LABELS: Record<AgentRole, string> = {
   devops: "DevOps",
   researcher: "Researcher",
   general: "General",
+  "routing-agent": "Routing Agent",
 };
+
+export const AGENT_COST_CLASSES = ["free", "metered", "critical"] as const;
+export type AgentCostClass = (typeof AGENT_COST_CLASSES)[number];
 
 export const AGENT_DEFAULT_MAX_CONCURRENT_RUNS = 20;
 export const WORKSPACE_BRANCH_ROUTINE_VARIABLE = "workspaceBranch";
