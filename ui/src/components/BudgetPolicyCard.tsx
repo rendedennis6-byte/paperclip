@@ -24,6 +24,7 @@ function windowLabel(windowKind: BudgetPolicySummary["windowKind"]) {
 
 function statusTone(status: BudgetPolicySummary["status"]) {
   if (status === "hard_stop") return "text-red-300 border-red-500/30 bg-red-500/10";
+  if (status === "warn_high") return "text-orange-200 border-orange-500/30 bg-orange-500/10";
   if (status === "warning") return "text-amber-200 border-amber-500/30 bg-amber-500/10";
   return "text-emerald-200 border-emerald-500/30 bg-emerald-500/10";
 }
@@ -50,7 +51,10 @@ export function BudgetPolicyCard({
   const parsedDraft = parseDollarInput(draftBudget);
   const canSave = typeof parsedDraft === "number" && parsedDraft !== summary.amount && Boolean(onSave);
   const progress = summary.amount > 0 ? Math.min(100, summary.utilizationPercent) : 0;
-  const StatusIcon = summary.status === "hard_stop" ? ShieldAlert : summary.status === "warning" ? AlertTriangle : Wallet;
+  const StatusIcon =
+    summary.status === "hard_stop" ? ShieldAlert :
+    summary.status === "warn_high" || summary.status === "warning" ? AlertTriangle :
+    Wallet;
   const isPlain = variant === "plain";
 
   const observedBudgetGrid = isPlain ? (

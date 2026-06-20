@@ -195,8 +195,8 @@ export function Costs() {
     queryKey: queryKeys.budgets.overview(companyId),
     queryFn: () => budgetsApi.overview(companyId),
     enabled: !!selectedCompanyId && customReady,
-    refetchInterval: 30_000,
-    staleTime: 5_000,
+    refetchInterval: 300_000,
+    staleTime: 60_000,
   });
 
   const invalidateBudgetViews = () => {
@@ -293,40 +293,40 @@ export function Costs() {
     queryKey: queryKeys.usageByProvider(companyId, from || undefined, to || undefined),
     queryFn: () => costsApi.byProvider(companyId, from || undefined, to || undefined),
     enabled: !!selectedCompanyId && customReady && (mainTab === "providers" || mainTab === "billers"),
-    refetchInterval: 30_000,
-    staleTime: 10_000,
+    refetchInterval: 300_000,
+    staleTime: 60_000,
   });
 
   const { data: billerData } = useQuery({
     queryKey: queryKeys.usageByBiller(companyId, from || undefined, to || undefined),
     queryFn: () => costsApi.byBiller(companyId, from || undefined, to || undefined),
     enabled: !!selectedCompanyId && customReady && mainTab === "billers",
-    refetchInterval: 30_000,
-    staleTime: 10_000,
+    refetchInterval: 300_000,
+    staleTime: 60_000,
   });
 
   const { data: weekData } = useQuery({
     queryKey: queryKeys.usageByProvider(companyId, weekRange.from, weekRange.to),
     queryFn: () => costsApi.byProvider(companyId, weekRange.from, weekRange.to),
     enabled: !!selectedCompanyId && (mainTab === "providers" || mainTab === "billers"),
-    refetchInterval: 30_000,
-    staleTime: 10_000,
+    refetchInterval: 300_000,
+    staleTime: 60_000,
   });
 
   const { data: weekBillerData } = useQuery({
     queryKey: queryKeys.usageByBiller(companyId, weekRange.from, weekRange.to),
     queryFn: () => costsApi.byBiller(companyId, weekRange.from, weekRange.to),
     enabled: !!selectedCompanyId && mainTab === "billers",
-    refetchInterval: 30_000,
-    staleTime: 10_000,
+    refetchInterval: 300_000,
+    staleTime: 60_000,
   });
 
   const { data: windowData } = useQuery({
     queryKey: queryKeys.usageWindowSpend(companyId),
     queryFn: () => costsApi.windowSpend(companyId),
     enabled: !!selectedCompanyId && mainTab === "providers",
-    refetchInterval: 30_000,
-    staleTime: 10_000,
+    refetchInterval: 300_000,
+    staleTime: 60_000,
   });
 
   const { data: quotaData, isLoading: quotaLoading } = useQuery({

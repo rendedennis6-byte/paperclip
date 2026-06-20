@@ -30,17 +30,35 @@ export function BudgetIncidentCard({
   onRaiseAndResume,
   onKeepPaused,
   isMutating,
+  compact = false,
 }: {
   incident: BudgetIncident;
   onRaiseAndResume: (amountCents: number) => void;
   onKeepPaused: () => void;
   isMutating?: boolean;
+  compact?: boolean;
 }) {
   const [draftAmount, setDraftAmount] = useState(
     centsInputValue(Math.max(incident.amountObserved + 1000, incident.amountLimit)),
   );
   const parsed = parseDollarInput(draftAmount);
   const stateLabel = incidentStateLabel(incident);
+
+  if (compact) {
+    return (
+      <div className="flex items-center justify-between gap-3 rounded-lg border border-red-500/20 px-3 py-2 text-sm">
+        <div className="flex items-center gap-2 min-w-0">
+          <Badge variant={incident.status === "resolved" ? "outline" : "secondary"}>
+            {stateLabel}
+          </Badge>
+          <span className="truncate text-muted-foreground">
+            {incident.scopeName} — {formatCents(incident.amountObserved)} of {formatCents(incident.amountLimit)}
+          </span>
+        </div>
+        <AlertOctagon className="h-3.5 w-3.5 shrink-0 text-red-400" />
+      </div>
+    );
+  }
 
   return (
     <Card className="overflow-hidden border-red-500/20 bg-[linear-gradient(180deg,rgba(255,70,70,0.10),rgba(255,255,255,0.02))]">
