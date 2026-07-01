@@ -6158,7 +6158,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eq(issues.companyId, claimed.companyId),
             // Mention/context runs can touch an issue, but only the current assignee
             // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
+            // Allow NULL assigneeAgentId so unassigned issues can be claimed (NULL = NULL is UNKNOWN in SQL).
+            or(isNull(issues.assigneeAgentId), eq(issues.assigneeAgentId, claimed.agentId)),
             or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
           ),
         );
