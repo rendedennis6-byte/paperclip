@@ -950,7 +950,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
-  it("queues exactly one retry when the recorded local pid is dead", async () => {
+  it("schedules exactly one retry with backoff when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       processPid: 999_999_999,
       contextSnapshot: {
@@ -983,7 +983,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       timeoutConfigured: false,
       timeoutFired: false,
     });
-    expect(retryRun?.status).toBe("queued");
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryReason).toBe("process_lost");
+    expect(retryRun?.scheduledRetryAt).toBeTruthy();
     expect(retryRun?.retryOfRunId).toBe(runId);
     expect(retryRun?.processLossRetryCount).toBe(1);
     expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
@@ -1050,7 +1052,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(failedRun?.error).toContain("descendant process group");
 
     const retryRun = runs.find((row) => row.id !== runId);
-    expect(retryRun?.status).toBe("queued");
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryReason).toBe("process_lost");
 
     const issue = await db
       .select()
@@ -1058,6 +1061,58 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+  });
+
+  it("suppresses retry and posts storm comment when 3+ process_lost events in 5 minutes", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      processPid: 999_999_999,
+    });
+
+    const recentNow = new Date();
+    for (let i = 0; i < 3; i++) {
+      const prevRunId = randomUUID();
+      const prevWakeId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: prevWakeId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "process_lost_retry",
+        payload: {},
+        status: "failed",
+        runId: prevRunId,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: prevRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        wakeupRequestId: prevWakeId,
+        contextSnapshot: { issueId },
+        errorCode: "process_lost",
+        processLossRetryCount: 1,
+        createdAt: new Date(recentNow.getTime() - (i + 1) * 30_000),
+        updatedAt: recentNow,
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId && !["failed", "running"].includes(row.status));
+    expect(retryRun).toBeUndefined();
+
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.errorCode).toBe("process_lost");
+    expect(failedRun?.error).toContain("storm");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((c) => c.body?.includes("process_lost storm"))).toBe(true);
   });
 
   it("blocks the issue when process-loss retry is exhausted and the immediate continuation recovery also fails", async () => {

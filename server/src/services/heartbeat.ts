@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -229,6 +229,9 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
+const PROCESS_LOST_BACKOFF_DELAYS_MS = [5_000, 15_000, 45_000] as const;
+const PROCESS_LOST_STORM_WINDOW_MS = 5 * 60 * 1000;
+const PROCESS_LOST_STORM_THRESHOLD = 3;
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
 const MAX_TURN_CONTINUATION_MAX_ATTEMPTS_CAP = 10;
@@ -4877,10 +4880,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "retry_exhausted" as const, queuedRun: null };
   }
 
+  async function countRecentProcessLostForAgent(
+    agentId: string,
+    companyId: string,
+    now: Date,
+  ): Promise<number> {
+    const windowStart = new Date(now.getTime() - PROCESS_LOST_STORM_WINDOW_MS);
+    const rows = await db
+      .select({ count: sql<number>`cast(count(*) as int)` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.errorCode, "process_lost"),
+          gte(heartbeatRuns.createdAt, windowStart),
+        ),
+      );
+    return rows[0]?.count ?? 0;
+  }
+
   async function enqueueProcessLossRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     now: Date,
+    backoffIndex: number,
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
@@ -4892,6 +4916,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       wakeReason: "process_lost_retry",
       retryReason: "process_lost",
     }, "normal_model");
+
+    const delayMs = PROCESS_LOST_BACKOFF_DELAYS_MS[Math.min(backoffIndex, PROCESS_LOST_BACKOFF_DELAYS_MS.length - 1)];
+    const retryDueAt = new Date(now.getTime() + delayMs);
 
     const queued = await db.transaction(async (tx) => {
       const wakeupRequest = await tx
@@ -4921,7 +4948,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId: run.agentId,
           invocationSource: "automation",
           triggerDetail: "system",
-          status: "queued",
+          status: "scheduled_retry",
+          scheduledRetryAt: retryDueAt,
+          scheduledRetryReason: "process_lost",
+          scheduledRetryAttempt: backoffIndex + 1,
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: retryContextSnapshot,
           sessionIdBefore: sessionBefore,
@@ -4971,9 +5001,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: "Queued automatic retry after orphaned child process was confirmed dead",
+      message: `Scheduled automatic retry after orphaned child process was confirmed dead (backoff ${delayMs}ms, attempt ${backoffIndex + 1})`,
       payload: {
         retryOfRunId: run.id,
+        backoffMs: delayMs,
+        scheduledRetryAt: retryDueAt.toISOString(),
       },
     });
 
@@ -6758,11 +6790,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+      const isRetryEligible = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+      const recentProcessLostCount = isRetryEligible
+        ? await countRecentProcessLostForAgent(run.agentId, run.companyId, now)
+        : 0;
+      const isStorm = isRetryEligible && recentProcessLostCount >= PROCESS_LOST_STORM_THRESHOLD;
+      const shouldRetry = isRetryEligible && !isStorm;
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const stormMessage = isStorm
+        ? `${baseMessage}; process_lost storm detected (${recentProcessLostCount} losses in 5min) — retry suppressed`
+        : null;
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: shouldRetry ? `${baseMessage}; retrying with backoff` : (stormMessage ?? baseMessage),
         errorCode: "process_lost",
         finishedAt: now,
         resultJson: mergeRunStopMetadataForAgent(
@@ -6771,13 +6811,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           {
             resultJson: parseObject(run.resultJson),
             errorCode: "process_lost",
-            errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+            errorMessage: shouldRetry ? `${baseMessage}; retrying with backoff` : (stormMessage ?? baseMessage),
           },
         ),
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: shouldRetry ? `${baseMessage}; retrying with backoff` : (stormMessage ?? baseMessage),
       });
       if (!finalizedRun) finalizedRun = await getRun(run.id);
       if (!finalizedRun) continue;
@@ -6794,10 +6834,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (shouldRetry) {
         const agent = await getAgent(run.agentId);
         if (agent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
+          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now, recentProcessLostCount);
         }
       } else {
         await releaseIssueExecutionAndPromote(finalizedRun);
+        if (isStorm) {
+          const contextSnapshot = parseObject(finalizedRun.contextSnapshot);
+          const issueId = readNonEmptyString(contextSnapshot.issueId);
+          if (issueId) {
+            await issuesSvc.addComment(
+              issueId,
+              `**process_lost storm** — ${recentProcessLostCount} process losses detected in the last 5 minutes for this agent. Automatic retry suppressed to prevent runaway. Manual investigation required before resuming.`,
+              { agentId: finalizedRun.agentId, runId: finalizedRun.id },
+            ).catch(() => undefined);
+          }
+        }
       }
 
       await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
@@ -6805,13 +6856,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         stream: "system",
         level: "error",
         message: shouldRetry
-          ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
-          : baseMessage,
+          ? `${baseMessage}; scheduled retry ${retriedRun?.id ?? ""}`.trim()
+          : (stormMessage ?? baseMessage),
         payload: {
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+          ...(isStorm ? { stormDetected: true, recentProcessLostCount } : {}),
         },
       });
 
