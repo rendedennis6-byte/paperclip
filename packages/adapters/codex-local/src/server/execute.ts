@@ -54,6 +54,7 @@ import {
   classifyCodexAuthRefreshFailure,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
+  isCodexInvalidRequestError,
   isCodexProviderQuotaError,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
@@ -1295,10 +1296,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: attempt.proc.stderr,
           errorMessage: fallbackErrorMessage,
         });
+      // A 400 invalid_request_error means the request body itself was rejected (e.g. a
+      // corrupted resumed-session rollout entry with an empty tool-call `name`).
+      // Retrying the identical request against the identical session can never
+      // succeed, so this must be classified ahead of - and excluded from - the
+      // transient/harness-crash buckets that drive automatic retries.
+      const invalidRequest =
+        (attempt.proc.exitCode ?? 0) !== 0 &&
+        !authRefreshFailure &&
+        !providerQuota &&
+        isCodexInvalidRequestError({
+          stdout: attempt.proc.stdout,
+          stderr: attempt.proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
       const transientUpstream =
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&
         !providerQuota &&
+        !invalidRequest &&
         isCodexTransientUpstreamError({
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
@@ -1307,6 +1323,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const harnessCrash =
         !authRefreshFailure &&
         !providerQuota &&
+        !invalidRequest &&
         !transientUpstream &&
         isCodexHarnessCrash({
           exitCode: attempt.proc.exitCode,
@@ -1315,7 +1332,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       const errorFamily =
         authRefreshFailure ??
-        (providerQuota ? "provider_quota" : transientUpstream || harnessCrash ? "transient_upstream" : null);
+        (providerQuota
+          ? "provider_quota"
+          : invalidRequest
+          ? "non_retryable_request"
+          : transientUpstream || harnessCrash
+          ? "transient_upstream"
+          : null);
 
       return {
         exitCode: attempt.proc.exitCode,
@@ -1330,6 +1353,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ? authRefreshFailure
             : providerQuota
             ? "provider_quota"
+            : invalidRequest
+            ? "codex_invalid_request"
             : transientUpstream
             ? "codex_transient_upstream"
             : harnessCrash

@@ -7,6 +7,11 @@ import {
 
 const CODEX_TRANSIENT_UPSTREAM_RE =
   /(?:we(?:'|’)re\s+currently\s+experiencing\s+high\s+demand|temporary\s+errors|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|service\s+unavailable|try\s+again\s+later)/i;
+// A 400 `invalid_request_error` from the Codex/OpenAI backend means the request body
+// itself is malformed (e.g. a corrupted resumed-session rollout entry). Retrying the
+// identical request reproduces the identical error, so this is always terminal for the
+// current resume attempt rather than transient infra.
+const CODEX_INVALID_REQUEST_RE = /\binvalid_request_error\b/i;
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
 const CODEX_USAGE_LIMIT_RE =
   /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
@@ -325,4 +330,13 @@ export function isCodexProviderQuotaError(input: {
 }): boolean {
   const haystack = buildCodexErrorHaystack(input);
   return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(input) != null;
+}
+
+export function isCodexInvalidRequestError(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = buildCodexErrorHaystack(input);
+  return CODEX_INVALID_REQUEST_RE.test(haystack);
 }

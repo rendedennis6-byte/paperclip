@@ -287,6 +287,10 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_exhausted",
   "issue_paused",
   "issue_dependencies_blocked",
+  // Deterministic 400 from the Codex/OpenAI backend (malformed request body, e.g. a
+  // corrupted resumed-session rollout entry). An identical retry reproduces the
+  // identical error, so retrying only burns run slots (RENA-50574).
+  "codex_invalid_request",
 ]);
 
 // A continuation cancelled with this code is a *deliberate wait* (the latest run

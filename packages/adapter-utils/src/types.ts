@@ -71,7 +71,10 @@ export type AdapterExecutionErrorFamily =
   | "model_refusal"
   | "refresh_token_reused"
   | "refresh_token_expired"
-  | "refresh_token_invalidated";
+  | "refresh_token_invalidated"
+  // Deterministic request-shape rejection from the provider backend (e.g. a 400
+  // invalid_request_error). Retrying the identical request can never succeed.
+  | "non_retryable_request";
 
 export interface AdapterExecutionResult {
   exitCode: number | null;
