@@ -221,6 +221,32 @@ PR #2218 (`feat/external-adapter-phase1`) adds external adapter support. See roo
 - Built-in UI adapters can shadow external plugin parsers; external override pause/resume should restore the built-in parser.
 - Reference external adapters: Droid (npm); Hermes can also be tested as an override package.
 
+## 12. Rende Fleet: Fork-Master Is the Deploy Source (RENA-55599)
+
+The Rende fleet's GitHub token (`rendedennis6-byte`) has **pull-only** access to
+`paperclipai/paperclip` (upstream) and **admin/push** access to this fork
+(`rendedennis6-byte/paperclip`). Merges on upstream `master` can only be performed
+by the Paperclip maintainers.
+
+Consequences for every Rende fleet agent:
+
+1. **Do not wait for upstream to merge fleet PRs.** "Wait for upstream merge" is not
+   a viable Rende deployment strategy — the fleet has no merge rights there.
+2. **`master` on this fork is the canonical Rende deploy source.** All fleet fixes
+   are merged here via real git checkouts (upstream PR branches live in this fork,
+   `head.repo == rendedennis6-byte/paperclip`), conflicts resolved locally, then
+   pushed to fork `master`.
+3. **Upstream PRs stay open as optional contributions**, not as the deployment
+   mechanism. Landing them upstream is a nice-to-have for `paperclipai/paperclip`,
+   never a blocker for Rende deployment.
+4. **New fixes:** branch from fork `master`, open the PR against **fork `master`**
+   for review/CI. Optionally also open a second PR against `upstream:master` as a
+   contribution back — but that second PR is not on the fleet's critical path.
+5. Deploying fork `master` to the running Rende Paperclip instance is a separate,
+   deliberate maintenance-window action (dist build or patch extraction) — it does
+   not happen automatically as branches land here, and must not touch a live server
+   outside a maintenance window.
+
 ## Design system
 
 `DESIGN.md` at the repo root is the source of truth for UI design decisions. The token-only rule applies to all `ui/` changes: every color, spacing, radius, type, shadow, and motion value in `ui/src/components/**` and `ui/src/pages/**` comes from the token layer in `ui/src/index.css` — no hex, raw px, arbitrary Tailwind bracket values, or raw `font-size`/`fontSize` declarations in components, outside the documented allowlist in `ui/src/index.css`. Run `pnpm check:token-gates` (`scripts/check-token-gates.mjs`) before committing UI changes — it fails on any violation not covered by that allowlist.
