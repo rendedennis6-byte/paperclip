@@ -8133,6 +8133,26 @@ export function issueRoutes(
       return;
     }
 
+    if (existing.assigneeAgentId && existing.assigneeAgentId !== issue.assigneeAgentId) {
+      // The previous assignee may still have a queued run for this issue
+      // (e.g. a continuation/recovery run). Cancel it eagerly instead of
+      // waiting for the lazy staleness check, which only fires once that
+      // agent's queue reaches the run AND it has a free concurrency slot -
+      // otherwise it can strand the run, and any execution lock it holds,
+      // for hours (RENA-55610).
+      const reassignedIssueId = issue.id;
+      const reassignedIssueCompanyId = issue.companyId;
+      const previousAssigneeAgentId = existing.assigneeAgentId;
+      await heartbeat
+        .cancelStaleQueuedRunsForIssue(reassignedIssueCompanyId, reassignedIssueId, previousAssigneeAgentId)
+        .catch((err) => {
+          logger.warn(
+            { err, issueId: reassignedIssueId, previousAssigneeAgentId },
+            "failed to cancel stale queued runs after issue reassignment",
+          );
+        });
+    }
+
     if (enteringBlocked) {
       const blockedIssue = issue;
       let ownerNotifiedAt: Date | null = null;

@@ -104,6 +104,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  cancelStaleQueuedRunsForIssue: vi.fn(async () => 0),
 }));
 const mockExternalObjectService = vi.hoisted(() => ({
   getIssueSummaries: vi.fn(async () => new Map()),
@@ -500,6 +501,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
     mockHeartbeatService.cancelRun.mockReset();
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockHeartbeatService.cancelStaleQueuedRunsForIssue.mockReset();
+    mockHeartbeatService.cancelStaleQueuedRunsForIssue.mockResolvedValue(0);
     mockIssueApprovalService.link.mockReset();
     mockIssueApprovalService.unlink.mockReset();
     mockIssueApprovalService.listApprovalsForIssue.mockReset();
