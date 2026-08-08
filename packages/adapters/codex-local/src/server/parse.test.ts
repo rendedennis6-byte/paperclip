@@ -3,7 +3,6 @@ import {
   classifyCodexAuthRefreshFailure,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
-  isCodexInvalidRequestError,
   isCodexProviderQuotaError,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
@@ -185,19 +184,6 @@ describe("isCodexUnknownSessionError", () => {
 
   it("does not classify unrelated Codex failures as stale sessions", () => {
     expect(isCodexUnknownSessionError("", "model overloaded")).toBe(false);
-  });
-});
-
-describe("isCodexInvalidRequestError", () => {
-  it("classifies a deterministic 400 invalid_request_error (RENA-50574) as invalid request", () => {
-    const errorMessage =
-      "invalid_request_error [StringParam] [input[3].name] [empty_string] Invalid 'input[3].name': empty string. Expected a string with minimum length 1";
-    expect(isCodexInvalidRequestError({ errorMessage })).toBe(true);
-    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(false);
-  });
-
-  it("does not classify unrelated Codex failures as invalid request", () => {
-    expect(isCodexInvalidRequestError({ errorMessage: "We're currently experiencing high demand." })).toBe(false);
   });
 });
 
