@@ -2309,6 +2309,7 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
    A path may appear more than once if it has more than one distinct
    allowlisted concern. Paths are matched by the gate script as a substring
    of the file being checked (repo-relative, POSIX-style).
+   * allow ui/src/components/AppErrorBoundary.tsx — root-level error boundary must render legibly even when theme CSS variables themselves are the cause of (or were never applied due to) the crash; inline hardcoded colors/font-sizes are the intended fallback, not a rendered token value (RENA-52061/RENA-55148)
    * allow ui/src/pages/CompanyEnvironments.tsx — xterm.js terminal theme config (background/foreground/cursor/cursorAccent/selectionBackground hex, fontSize: 12); functional third-party option object, not a rendered CSS value
    * allow ui/src/pages/CompanySettings.tsx — <input type="color"> value; the DOM color-picker control requires a real hex string
    * allow ui/src/components/issue-properties/IssueProperties.tsx — newLabelColor color-picker seed state persisted into the label-create payload sent to the backend; a var() string would corrupt that payload
