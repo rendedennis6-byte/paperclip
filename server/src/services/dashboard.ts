@@ -4,6 +4,7 @@ import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from 
 import { notFound } from "../errors.js";
 import { budgetService } from "./budgets.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { costService } from "./costs.js";
 
 const DASHBOARD_RUN_ACTIVITY_DAYS = 14;
 
@@ -25,6 +26,7 @@ function getRecentUtcDateKeys(now: Date, days: number): string[] {
 
 export function dashboardService(db: Db) {
   const budgets = budgetService(db);
+  const costs = costService(db);
   return {
     summary: async (companyId: string) => {
       const company = await db
@@ -102,6 +104,10 @@ export function dashboardService(db: Db) {
       // restart-killed run whose retry succeeded is pulled out of the headline
       // failed count. error_code is carried through so a failure spike can be
       // attributed to an error class (e.g. process_lost, provider_quota).
+      // Both recursive arms are bounded to the chart window: a retry is always
+      // created after the run it retries, so ancestors of an out-of-window
+      // child are themselves out of window and invisible to the membership
+      // test below. Unbounded, the seed walks every run the company ever had.
       const runActivityRows = (await db.execute(sql`
         WITH RECURSIVE recovered_runs(id) AS (
           SELECT parent.id
@@ -109,11 +115,13 @@ export function dashboardService(db: Db) {
           JOIN ${heartbeatRuns} AS parent ON parent.id = child.retry_of_run_id
           WHERE child.company_id = ${companyId}
             AND child.status = 'succeeded'
+            AND child.created_at >= ${runActivityStart.toISOString()}::timestamptz
           UNION
           SELECT parent.id
           FROM recovered_runs rr
           JOIN ${heartbeatRuns} AS child ON child.id = rr.id
           JOIN ${heartbeatRuns} AS parent ON parent.id = child.retry_of_run_id
+          WHERE child.created_at >= ${runActivityStart.toISOString()}::timestamptz
         )
         SELECT
           to_char(run.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
@@ -177,7 +185,11 @@ export function dashboardService(db: Db) {
         company.budgetMonthlyCents > 0
           ? (monthSpendCents / company.budgetMonthlyCents) * 100
           : 0;
-      const budgetOverview = await budgets.overview(companyId);
+      const [budgetOverview, guardrail, costByClassRows] = await Promise.all([
+        budgets.overview(companyId),
+        budgets.getCompanyGuardrailLevel(companyId),
+        costs.byCostClass(companyId),
+      ]);
 
       return {
         companyId,
@@ -200,6 +212,11 @@ export function dashboardService(db: Db) {
           pausedAgents: budgetOverview.pausedAgentCount,
           pausedProjects: budgetOverview.pausedProjectCount,
         },
+        guardrail,
+        costByClass: costByClassRows.map((row) => ({
+          costClass: row.costClass ?? "metered",
+          spentCents: Number(row.spentCents),
+        })),
         runActivity: Array.from(runActivity.values()),
       };
     },

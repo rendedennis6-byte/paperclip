@@ -17,6 +17,9 @@ export interface BudgetPolicy {
   windowKind: BudgetWindowKind;
   amount: number;
   warnPercent: number;
+  warnHighPercent: number;
+  warnRecoveryPercent: number;
+  warnHighRecoveryPercent: number;
   hardStopEnabled: boolean;
   notifyEnabled: boolean;
   isActive: boolean;
@@ -39,6 +42,9 @@ export interface BudgetPolicySummary {
   remainingAmount: number;
   utilizationPercent: number;
   warnPercent: number;
+  warnHighPercent: number;
+  warnRecoveryPercent: number;
+  warnHighRecoveryPercent: number;
   hardStopEnabled: boolean;
   notifyEnabled: boolean;
   isActive: boolean;
@@ -87,6 +93,9 @@ export interface BudgetPolicyUpsertInput {
   windowKind?: BudgetWindowKind;
   amount: number;
   warnPercent?: number;
+  warnHighPercent?: number;
+  warnRecoveryPercent?: number;
+  warnHighRecoveryPercent?: number;
   hardStopEnabled?: boolean;
   notifyEnabled?: boolean;
   isActive?: boolean;

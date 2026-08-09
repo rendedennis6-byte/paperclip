@@ -867,6 +867,9 @@ export function AgentDetail() {
       utilizationPercent:
         budgetMonthlyCents > 0 ? Number(((spentMonthlyCents / budgetMonthlyCents) * 100).toFixed(2)) : 0,
       warnPercent: 80,
+      warnHighPercent: 85,
+      warnRecoveryPercent: 55,
+      warnHighRecoveryPercent: 75,
       hardStopEnabled: true,
       notifyEnabled: true,
       isActive: budgetMonthlyCents > 0,

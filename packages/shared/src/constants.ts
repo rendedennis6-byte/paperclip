@@ -16,6 +16,15 @@ export type BindMode = (typeof BIND_MODES)[number];
 export const AUTH_BASE_URL_MODES = ["auto", "explicit"] as const;
 export type AuthBaseUrlMode = (typeof AUTH_BASE_URL_MODES)[number];
 
+export const AGENT_COST_CLASSES = ["free", "metered", "critical"] as const;
+export type AgentCostClass = (typeof AGENT_COST_CLASSES)[number];
+
+export const AGENT_COST_CLASS_LABELS: Record<AgentCostClass, string> = {
+  free: "Free",
+  metered: "Metered",
+  critical: "Critical",
+};
+
 export const AGENT_STATUSES = [
   "active",
   "paused",
@@ -825,6 +834,17 @@ export const BUDGET_INCIDENT_RESOLUTION_ACTIONS = [
   "raise_budget_and_resume",
 ] as const;
 export type BudgetIncidentResolutionAction = (typeof BUDGET_INCIDENT_RESOLUTION_ACTIONS)[number];
+
+export const GUARDRAIL_STAGES = { OK: 0, WARN: 1, HIGH: 2, HARD_STOP: 3 } as const;
+export type GuardrailStage = (typeof GUARDRAIL_STAGES)[keyof typeof GUARDRAIL_STAGES];
+
+export const GUARDRAIL_THRESHOLDS = {
+  WARN: 60,
+  HIGH: 85,
+  HARD_STOP: 100,
+  WARN_RECOVERY: 55,
+  HIGH_RECOVERY: 75,
+} as const;
 
 export const HEARTBEAT_INVOCATION_SOURCES = [
   "timer",

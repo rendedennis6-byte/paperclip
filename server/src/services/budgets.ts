@@ -41,8 +41,21 @@ export type BudgetEnforcementScope = {
   scopeId: string;
 };
 
+export type BudgetAlertPayload = {
+  companyId: string;
+  scopeType: BudgetScopeType;
+  scopeId: string;
+  scopeName: string;
+  thresholdType: "soft" | "hard";
+  observedCents: number;
+  limitCents: number;
+  utilizationPercent: number;
+  windowKind: BudgetWindowKind;
+};
+
 export type BudgetServiceHooks = {
   cancelWorkForScope?: (scope: BudgetEnforcementScope) => Promise<void>;
+  onBudgetAlert?: (alert: BudgetAlertPayload) => Promise<void>;
 };
 
 function currentUtcMonthWindow(now = new Date()) {
@@ -334,6 +347,9 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       remainingAmount: amount > 0 ? Math.max(0, amount - observedAmount) : 0,
       utilizationPercent,
       warnPercent: policy.warnPercent,
+      warnHighPercent: policy.warnHighPercent ?? 85,
+      warnRecoveryPercent: policy.warnRecoveryPercent ?? 55,
+      warnHighRecoveryPercent: policy.warnHighRecoveryPercent ?? 75,
       hardStopEnabled: policy.hardStopEnabled,
       notifyEnabled: policy.notifyEnabled,
       isActive: policy.isActive,
@@ -351,7 +367,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     policy: PolicyRow,
     thresholdType: BudgetThresholdType,
     amountObserved: number,
-  ) {
+  ): Promise<{ incident: IncidentRow; isNew: boolean } | null> {
     const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
     const existing = await db
       .select()
@@ -365,7 +381,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         ),
       )
       .then((rows) => rows[0] ?? null);
-    if (existing) return { incident: existing, created: false };
+    if (existing) return { incident: existing, isNew: false };
 
     const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
     const payload = buildApprovalPayload({
@@ -411,7 +427,8 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       })
       .returning()
       .then((rows) => rows[0] ?? null);
-    return incident ? { incident, created: true } : null;
+
+    return incident ? { incident, isNew: true } : null;
   }
 
   async function resolveOpenSoftIncidents(policyId: string) {
@@ -540,6 +557,9 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           .set({
             amount,
             warnPercent: input.warnPercent ?? existing.warnPercent,
+            warnHighPercent: input.warnHighPercent ?? existing.warnHighPercent,
+            warnRecoveryPercent: input.warnRecoveryPercent ?? existing.warnRecoveryPercent,
+            warnHighRecoveryPercent: input.warnHighRecoveryPercent ?? existing.warnHighRecoveryPercent,
             hardStopEnabled: input.hardStopEnabled ?? existing.hardStopEnabled,
             notifyEnabled: input.notifyEnabled ?? existing.notifyEnabled,
             isActive: nextIsActive,
@@ -669,17 +689,27 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         if (policy.metric !== "billed_cents" || policy.amount <= 0) continue;
         const observedAmount = await computeObservedAmount(db, policy);
         const softThreshold = Math.ceil((policy.amount * policy.warnPercent) / 100);
+        const utilizationPercent = Number(((observedAmount / policy.amount) * 100).toFixed(2));
+
+        let openSoftIncident: IncidentRow | null = null;
+        // If a single event jumps straight past HIGH (e.g. 40% -> 90%), the
+        // company-scope HIGH-escalation block below already covers notification;
+        // skip the WARN-level notify here so we don't double-send for one crossing.
+        const jumpsStraightToHighOnCreate =
+          policy.scopeType === "company" && utilizationPercent >= (policy.warnHighPercent ?? 85);
 
         if (policy.notifyEnabled && observedAmount >= softThreshold) {
-          const softIncident = await createIncidentIfNeeded(policy, "soft", observedAmount);
-          if (softIncident?.created) {
+          const result = await createIncidentIfNeeded(policy, "soft", observedAmount);
+          openSoftIncident = result?.incident ?? null;
+          if (result?.isNew) {
+            const { incident: softIncident } = result;
             await logActivity(db, {
               companyId: policy.companyId,
               actorType: "system",
               actorId: "budget_service",
               action: "budget.soft_threshold_crossed",
               entityType: "budget_incident",
-              entityId: softIncident.incident.id,
+              entityId: softIncident.id,
               details: {
                 scopeType: policy.scopeType,
                 scopeId: policy.scopeId,
@@ -687,29 +717,90 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
                 amountLimit: policy.amount,
               },
             });
+            // Notify CEO only when the incident is newly created (avoid spam)
+            if (hooks.onBudgetAlert && !jumpsStraightToHighOnCreate) {
+              const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
+              await hooks.onBudgetAlert({
+                companyId: policy.companyId,
+                scopeType: policy.scopeType as BudgetScopeType,
+                scopeId: policy.scopeId,
+                scopeName: normalizeScopeName(policy.scopeType as BudgetScopeType, scope.name),
+                thresholdType: "soft",
+                observedCents: observedAmount,
+                limitCents: policy.amount,
+                utilizationPercent,
+                windowKind: policy.windowKind as BudgetWindowKind,
+              });
+            }
           }
+        }
+
+        // Company-wide guardrail stage escalation (1=WARN -> 2=HIGH). The soft/hard
+        // incident dedup above only distinguishes "crossed warnPercent" vs. "crossed
+        // 100%" once per window, which cannot represent the intermediate HIGH stage.
+        // Dedup this against the open soft incident's `highNotifiedAt` marker so it
+        // fires exactly once per window, independent of how many times this event
+        // (or later events) re-run evaluateCostEvent.
+        if (
+          policy.scopeType === "company" &&
+          hooks.onBudgetAlert &&
+          openSoftIncident &&
+          !openSoftIncident.highNotifiedAt &&
+          utilizationPercent >= (policy.warnHighPercent ?? 85)
+        ) {
+          await db
+            .update(budgetIncidents)
+            .set({ highNotifiedAt: new Date() })
+            .where(eq(budgetIncidents.id, openSoftIncident.id));
+          const scope = await resolveScopeRecord(db, "company", policy.scopeId);
+          await hooks.onBudgetAlert({
+            companyId: policy.companyId,
+            scopeType: "company",
+            scopeId: policy.scopeId,
+            scopeName: normalizeScopeName("company", scope.name),
+            thresholdType: "soft",
+            observedCents: observedAmount,
+            limitCents: policy.amount,
+            utilizationPercent,
+            windowKind: policy.windowKind as BudgetWindowKind,
+          });
         }
 
         if (policy.hardStopEnabled && observedAmount >= policy.amount) {
           await resolveOpenSoftIncidents(policy.id);
-          const hardIncident = await createIncidentIfNeeded(policy, "hard", observedAmount);
+          const result = await createIncidentIfNeeded(policy, "hard", observedAmount);
           await pauseAndCancelScopeForBudget(policy);
-          if (hardIncident?.created) {
+          if (result?.isNew) {
+            const { incident: hardIncident } = result;
             await logActivity(db, {
               companyId: policy.companyId,
               actorType: "system",
               actorId: "budget_service",
               action: "budget.hard_threshold_crossed",
               entityType: "budget_incident",
-              entityId: hardIncident.incident.id,
+              entityId: hardIncident.id,
               details: {
                 scopeType: policy.scopeType,
                 scopeId: policy.scopeId,
                 amountObserved: observedAmount,
                 amountLimit: policy.amount,
-                approvalId: hardIncident.incident.approvalId ?? null,
+                approvalId: hardIncident.approvalId ?? null,
               },
             });
+            if (hooks.onBudgetAlert) {
+              const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
+              await hooks.onBudgetAlert({
+                companyId: policy.companyId,
+                scopeType: policy.scopeType as BudgetScopeType,
+                scopeId: policy.scopeId,
+                scopeName: normalizeScopeName(policy.scopeType as BudgetScopeType, scope.name),
+                thresholdType: "hard",
+                observedCents: observedAmount,
+                limitCents: policy.amount,
+                utilizationPercent,
+                windowKind: policy.windowKind as BudgetWindowKind,
+              });
+            }
           }
         }
       }
@@ -726,11 +817,13 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           pauseReason: agents.pauseReason,
           companyId: agents.companyId,
           name: agents.name,
+          costClass: agents.costClass,
         })
         .from(agents)
         .where(eq(agents.id, agentId))
         .then((rows) => rows[0] ?? null);
       if (!agent || agent.companyId !== companyId) throw notFound("Agent not found");
+      const agentCostClass = (agent.costClass ?? "metered") as "free" | "metered" | "critical";
 
       const company = await db
         .select({
@@ -801,15 +894,49 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           ),
         )
         .then((rows) => rows[0] ?? null);
-      if (agentPolicy && agentPolicy.hardStopEnabled && agentPolicy.amount > 0) {
+      if (agentPolicy && agentPolicy.amount > 0) {
         const observed = await computeObservedAmount(db, agentPolicy);
-        if (observed >= agentPolicy.amount) {
-          return {
+        const utilizationPct = (observed / agentPolicy.amount) * 100;
+
+        // Hysteresis: if there is an open soft incident, use recovery thresholds
+        // to avoid flapping between stages when utilization sits in the grey zone.
+        const openSoftIncident = await db
+          .select({ id: budgetIncidents.id })
+          .from(budgetIncidents)
+          .where(
+            and(
+              eq(budgetIncidents.policyId, agentPolicy.id),
+              eq(budgetIncidents.thresholdType, "soft"),
+              eq(budgetIncidents.status, "open"),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+
+        const inActiveStage = openSoftIncident !== null;
+        const warnPct = inActiveStage
+          ? (agentPolicy.warnRecoveryPercent ?? 55)
+          : (agentPolicy.warnPercent ?? 60);
+        const warnHighPct = inActiveStage
+          ? (agentPolicy.warnHighRecoveryPercent ?? 75)
+          : (agentPolicy.warnHighPercent ?? 85);
+
+        const stage = utilizationPct >= 100 ? 3
+          : utilizationPct >= warnHighPct ? 2
+          : utilizationPct >= warnPct ? 1
+          : 0;
+
+        if (stage > 0) {
+          const agentBlock = {
             scopeType: "agent" as const,
             scopeId: agentId,
             scopeName: agent.name,
-            reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+            reason: stage === 3
+              ? "Agent cannot start because its budget hard-stop is still exceeded."
+              : `Agent budget at stage ${stage} (${utilizationPct.toFixed(1)}% utilization).`,
           };
+          if (stage === 3 && agentPolicy.hardStopEnabled) return agentBlock;
+          if (stage === 2 && agentCostClass !== "critical") return agentBlock;
+          if (stage === 1 && agentCostClass === "metered") return agentBlock;
         }
       }
 
@@ -861,6 +988,39 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         scopeName: project.name,
         reason: "Project is paused because its budget hard-stop was reached.",
       };
+    },
+
+    getCompanyGuardrailLevel: async (companyId: string): Promise<{ level: 0 | 1 | 2 | 3; utilizationPercent: number }> => {
+      const policy = await db
+        .select()
+        .from(budgetPolicies)
+        .where(
+          and(
+            eq(budgetPolicies.companyId, companyId),
+            eq(budgetPolicies.scopeType, "company"),
+            eq(budgetPolicies.scopeId, companyId),
+            eq(budgetPolicies.isActive, true),
+            eq(budgetPolicies.metric, "billed_cents"),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+
+      if (!policy || policy.amount <= 0) {
+        return { level: 0, utilizationPercent: 0 };
+      }
+
+      const observed = await computeObservedAmount(db, policy);
+      const utilizationPercent = Number(((observed / policy.amount) * 100).toFixed(2));
+      const warnPct = policy.warnPercent ?? 60;
+      const warnHighPct = policy.warnHighPercent ?? 85;
+
+      const level: 0 | 1 | 2 | 3 =
+        utilizationPercent >= 100 ? 3
+        : utilizationPercent >= warnHighPct ? 2
+        : utilizationPercent >= warnPct ? 1
+        : 0;
+
+      return { level, utilizationPercent };
     },
 
     resolveIncident: async (
