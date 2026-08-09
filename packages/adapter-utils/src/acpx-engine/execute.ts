@@ -2433,13 +2433,40 @@ function usdCostAmount(cost: AcpRuntimeUsageCost | null | undefined): number | n
   return cost.amount;
 }
 
+const ACPX_SESSION_SETUP_TIMEOUT_MS = 60_000;
+
+async function withAcpxSetupTimeout<T>(
+  label: string,
+  operation: Promise<T>,
+  timeoutMs = ACPX_SESSION_SETUP_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error(
+              `ACPX ${label} timed out after ${timeoutMs}ms with no response from the agent process ` +
+                `(it may be dead or unresponsive).`,
+            ),
+          );
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function readRuntimeStatus(
   runtime: AcpRuntime,
   handle: AcpRuntimeHandle,
 ): Promise<AcpRuntimeStatus | null> {
   if (!runtime.getStatus) return null;
   try {
-    return (await runtime.getStatus({ handle })) ?? null;
+    return (await withAcpxSetupTimeout("status snapshot", runtime.getStatus({ handle }))) ?? null;
   } catch {
     return null;
   }
@@ -3305,14 +3332,17 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             let ensureSessionMs: number | undefined;
             handle = await measureStartupStep(ctx, now, "acp.handshake", async () => {
               const ensureSessionStart = now();
-              const established = await runtime.ensureSession({
-                sessionKey: prepared.sessionKey,
-                agent: prepared.acpxAgent,
-                mode: prepared.mode,
-                cwd: prepared.cwd,
-                resumeSessionId,
-                sessionOptions: { env: prepared.env },
-              });
+              const established = await withAcpxSetupTimeout(
+                "session handshake",
+                runtime.ensureSession({
+                  sessionKey: prepared.sessionKey,
+                  agent: prepared.acpxAgent,
+                  mode: prepared.mode,
+                  cwd: prepared.cwd,
+                  resumeSessionId,
+                  sessionOptions: { env: prepared.env },
+                }),
+              );
               ensureSessionMs = now() - ensureSessionStart;
               return established;
             }, {
@@ -3337,13 +3367,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             let retryEnsureSessionMs: number | undefined;
             handle = await measureStartupStep(ctx, now, "acp.handshake", async () => {
               const ensureSessionStart = now();
-              const established = await runtime.ensureSession({
-                sessionKey: prepared.sessionKey,
-                agent: prepared.acpxAgent,
-                mode: prepared.mode,
-                cwd: prepared.cwd,
-                sessionOptions: { env: prepared.env },
-              });
+              const established = await withAcpxSetupTimeout(
+                "session handshake",
+                runtime.ensureSession({
+                  sessionKey: prepared.sessionKey,
+                  agent: prepared.acpxAgent,
+                  mode: prepared.mode,
+                  cwd: prepared.cwd,
+                  sessionOptions: { env: prepared.env },
+                }),
+              );
               retryEnsureSessionMs = now() - ensureSessionStart;
               return established;
             }, {
@@ -3424,12 +3457,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       rootSpan.end(false);
       const sessionHandle = handle;
       try {
-        await applySessionConfigOptions({
-          runtime,
-          handle: sessionHandle,
-          prepared,
-          onLog: ctx.onLog,
-        });
+        await withAcpxSetupTimeout(
+          "session configure",
+          applySessionConfigOptions({
+            runtime,
+            handle: sessionHandle,
+            prepared,
+            onLog: ctx.onLog,
+          }),
+        );
       } catch (err) {
         const { classified, message } = await emitAcpxFailure({
           ctx,
