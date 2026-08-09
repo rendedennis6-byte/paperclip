@@ -157,6 +157,25 @@ function signalCodexChild(
   return false;
 }
 
+// RENA-49746: Codex emits `{"type":"turn.completed",...}` on stdout once the turn's
+// work is fully done, but the child process can then hang for minutes before exiting.
+// Detecting this line lets the adapter terminate the child proactively instead of
+// waiting for the output-inactivity monitor (which mis-reports completed work as failed).
+export function stdoutChunkHasTurnCompleted(chunk: string): boolean {
+  if (typeof chunk !== "string" || chunk.indexOf("turn.completed") === -1) return false;
+  for (const rawLine of chunk.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed[0] !== "{") continue;
+    try {
+      const parsed = JSON.parse(trimmed) as { type?: unknown } | null;
+      if (parsed && parsed.type === "turn.completed") return true;
+    } catch {
+      // Not a complete JSON line (partial chunk); ignore.
+    }
+  }
+  return false;
+}
+
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
   const raw = env[key];
   return typeof raw === "string" && raw.trim().length > 0;
@@ -1204,6 +1223,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let monitorLogPromise: Promise<unknown> | null = null;
       const processActivityMonitor: { current: CodexProcessActivityMonitorHandle | null } = { current: null };
       const resolvedMonitorTimeoutMs = monitorResolution.mode === "disabled" ? null : monitorResolution.timeoutMs;
+      // RENA-49746: set once we proactively terminate the child on turn.completed.
+      let turnCompletedTermination = false;
+      let turnCompletedSigkillTimer: ReturnType<typeof setTimeout> | null = null;
 
       const monitor =
         monitorResolution.mode === "disabled"
@@ -1277,6 +1299,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             monitor?.noteOutputChunk(stream, chunk);
             if (stream === "stdout") {
               await onLog(stream, chunk);
+              // RENA-49746: terminate proactively on turn.completed so we do not
+              // wait out the output-inactivity monitor for a run whose work is done.
+              if (!turnCompletedTermination && stdoutChunkHasTurnCompleted(chunk)) {
+                const target = killTarget;
+                // Only act once we have a real child to terminate. If the spawn
+                // target is not yet known, leave the inactivity monitor armed as
+                // the fallback and re-evaluate on the next stdout chunk.
+                if (target && (target.pid != null || target.processGroupId != null)) {
+                  turnCompletedTermination = true;
+                  // Stop the inactivity monitor so it cannot also fire and
+                  // mislabel this completed run as a monitor timeout.
+                  monitor?.stop();
+                  const logLine =
+                    "[paperclip] adapter.invoke detected codex turn.completed; " +
+                    "terminating codex child via SIGTERM (5s grace, then SIGKILL) to avoid post-completion hang.\n";
+                  monitorLogPromise = Promise.resolve(onLog("stderr", logLine)).catch(() => {});
+                  signalCodexChild(target, "SIGTERM");
+                  turnCompletedSigkillTimer = setTimeout(() => {
+                    turnCompletedSigkillTimer = null;
+                    signalCodexChild(target, "SIGKILL");
+                  }, CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS);
+                  if (typeof (turnCompletedSigkillTimer as { unref?: () => void }).unref === "function") {
+                    (turnCompletedSigkillTimer as { unref: () => void }).unref();
+                  }
+                }
+              }
               return;
             }
             const cleaned = stripCodexRolloutNoise(chunk);
@@ -1294,6 +1342,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           },
           rawStderr: proc.stderr,
           parsed: parseCodexJsonl(proc.stdout),
+          turnCompleted: turnCompletedTermination,
           monitor: monitorFired
             ? {
                 fired: true as const,
@@ -1310,6 +1359,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           clearTimeout(sigkillTimer);
           sigkillTimer = null;
         }
+        if (turnCompletedSigkillTimer) {
+          clearTimeout(turnCompletedSigkillTimer);
+          turnCompletedSigkillTimer = null;
+        }
         if (monitorLogPromise) {
           await monitorLogPromise;
           monitorLogPromise = null;
@@ -1322,6 +1375,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string };
         rawStderr: string;
         parsed: ReturnType<typeof parseCodexJsonl>;
+        turnCompleted?: boolean;
         monitor?:
           | { fired: false }
           | { fired: true; terminationSignal: NodeJS.Signals | null; elapsedMsSinceLastEvent: number; timeoutMs: number };
@@ -1329,7 +1383,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       clearSessionOnMissingSession = false,
       isRetry = false,
     ): AdapterExecutionResult => {
-      if (attempt.monitor?.fired) {
+      // RENA-49746: when we terminated the child ourselves after codex reported
+      // turn.completed, the turn's results are already complete. Treat it as a
+      // successful run regardless of the exit code/signal produced by our own kill,
+      // and never surface a monitor-timeout or transient error for it.
+      const gracefulTurnCompletion = attempt.turnCompleted === true;
+      if (attempt.monitor?.fired && !gracefulTurnCompletion) {
         const errorMessage = formatOutputInactivityMonitorErrorMessage(attempt.monitor.elapsedMsSinceLastEvent);
         return {
           exitCode: null,
@@ -1397,7 +1456,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderrLine ||
         `Codex exited with code ${attempt.proc.exitCode ?? -1}`;
       const transientRetryNotBefore =
-        (attempt.proc.exitCode ?? 0) !== 0
+        !gracefulTurnCompletion && (attempt.proc.exitCode ?? 0) !== 0
           ? extractCodexRetryNotBefore({
               stdout: attempt.proc.stdout,
               stderr: attempt.proc.stderr,
@@ -1405,7 +1464,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             })
           : null;
       const authRefreshFailure =
-        (attempt.proc.exitCode ?? 0) !== 0
+        !gracefulTurnCompletion && (attempt.proc.exitCode ?? 0) !== 0
           ? classifyCodexAuthRefreshFailure({
               stdout: attempt.proc.stdout,
               stderr: attempt.proc.stderr,
@@ -1413,6 +1472,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             })
           : null;
       const providerQuota =
+        !gracefulTurnCompletion &&
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&
         isCodexProviderQuotaError({
@@ -1421,6 +1481,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
+        !gracefulTurnCompletion &&
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&
         !providerQuota &&
@@ -1447,7 +1508,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: attempt.proc.signal,
         timedOut: false,
         errorMessage:
-          (attempt.proc.exitCode ?? 0) === 0
+          gracefulTurnCompletion || (attempt.proc.exitCode ?? 0) === 0
             ? null
             : fallbackErrorMessage,
         errorCode:
