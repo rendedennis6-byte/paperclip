@@ -1504,8 +1504,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (providerQuota ? "provider_quota" : transientUpstream || harnessCrash ? "transient_upstream" : null);
 
       return {
-        exitCode: attempt.proc.exitCode,
-        signal: attempt.proc.signal,
+        exitCode: gracefulTurnCompletion ? 0 : attempt.proc.exitCode,
+        signal: gracefulTurnCompletion ? null : attempt.proc.signal,
         timedOut: false,
         errorMessage:
           gracefulTurnCompletion || (attempt.proc.exitCode ?? 0) === 0
