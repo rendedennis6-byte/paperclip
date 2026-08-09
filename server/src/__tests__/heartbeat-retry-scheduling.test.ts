@@ -2444,7 +2444,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
 
     it.skipIf(RESTART_BATCH_PROCESS_LOSS_REAP_THRESHOLD <= 1)(
-      "keeps immediate queueing for process-loss retries when a reap sweep finds only a few orphaned runs (below the restart-batch threshold)",
+      "applies ordinary process-loss backoff (not the restart-batch stagger) when a reap sweep finds only a few orphaned runs (below the restart-batch threshold)",
       async () => {
         const belowThresholdCount = RESTART_BATCH_PROCESS_LOSS_REAP_THRESHOLD - 1;
         const { runIds } = await seedRestartBatchProcessLossFixture({ count: belowThresholdCount });
@@ -2458,9 +2458,15 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           .where(inArray(heartbeatRuns.retryOfRunId, runIds));
         expect(retryRuns).toHaveLength(belowThresholdCount);
         for (const retryRun of retryRuns) {
-          expect(["queued", "running"]).toContain(retryRun.status);
-          expect(retryRun.scheduledRetryReason).toBeNull();
-          expect(retryRun.scheduledRetryAt).toBeNull();
+          // RENA-51447's per-run process-loss backoff still applies below the
+          // restart-batch threshold (land in scheduled_retry), but RENA-54107's
+          // restart-batch stagger must NOT kick in for a small sweep.
+          expect(retryRun.status).toBe("scheduled_retry");
+          expect(retryRun.scheduledRetryReason).toBe("process_lost_retry");
+          expect(retryRun.scheduledRetryAt).not.toBeNull();
+          expect(retryRun.processLossRetryCount).toBe(1);
+          const snapshot = retryRun.contextSnapshot as Record<string, unknown>;
+          expect(snapshot.restartBatchStaggerMs).toBeUndefined();
         }
       },
     );
