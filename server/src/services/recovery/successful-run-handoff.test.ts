@@ -3,6 +3,7 @@ import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
+  SUCCESSFUL_RUN_HANDOFF_NOTICE_MESSAGE_ID,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildFinishSuccessfulRunHandoffIdempotencyKey,
   buildSuccessfulRunHandoffInstruction,
@@ -12,6 +13,7 @@ import {
   isIdempotentFinishSuccessfulRunHandoffWakeStatus,
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
+  isSuccessfulRunHandoffRequiredNotice,
   noticeMetadataReferencesRecoveryAction,
 } from "./successful-run-handoff.js";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
@@ -401,6 +403,7 @@ describe("successful run handoff decision", () => {
     expect(notice.presentation).toEqual({
       kind: "system_notice",
       tone: "warning",
+      messageId: SUCCESSFUL_RUN_HANDOFF_NOTICE_MESSAGE_ID,
       title: "Missing issue disposition",
       detailsDefaultOpen: false,
     });
@@ -478,6 +481,10 @@ describe("successful run handoff decision", () => {
   });
 
   it("recognizes new notices and legacy markdown headings for fallback deduplication", () => {
+    expect(isSuccessfulRunHandoffRequiredNotice({
+      body: "beliebiger lokalisierter Anzeigetext",
+      presentation: { messageId: SUCCESSFUL_RUN_HANDOFF_NOTICE_MESSAGE_ID },
+    })).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody(SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY)).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);

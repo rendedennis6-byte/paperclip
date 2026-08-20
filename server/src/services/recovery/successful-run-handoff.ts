@@ -2,6 +2,7 @@ import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
+import { translateServerMessage } from "@paperclipai/shared/server-i18n";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
@@ -9,6 +10,8 @@ export const SUCCESSFUL_RUN_MISSING_STATE_REASON = "successful_run_missing_state
 export const DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS = 1;
 export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY =
   "Paperclip needs a disposition before this issue can continue.";
+export const SUCCESSFUL_RUN_HANDOFF_NOTICE_MESSAGE_ID =
+  "notice.successfulRun.missingDisposition.title" as const;
 export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY =
   "Paperclip could not resolve this issue's missing disposition automatically. The issue is blocked on a recovery owner.";
 export const LEGACY_SUCCESSFUL_RUN_HANDOFF_NOTICE_PREFIXES = [
@@ -158,10 +161,12 @@ function agentLinkRow(
 function systemNoticePresentation(input: {
   tone: IssueCommentPresentation["tone"];
   title: string;
+  messageId?: string;
 }): IssueCommentPresentation {
   return {
     kind: "system_notice",
     tone: input.tone,
+    messageId: input.messageId,
     title: input.title,
     detailsDefaultOpen: false,
   };
@@ -171,6 +176,14 @@ export function isSuccessfulRunHandoffRequiredNoticeBody(body: string) {
   const trimmed = body.trim();
   return trimmed === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY ||
     LEGACY_SUCCESSFUL_RUN_HANDOFF_NOTICE_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+export function isSuccessfulRunHandoffRequiredNotice(input: {
+  body: string;
+  presentation?: Pick<IssueCommentPresentation, "messageId"> | null;
+}) {
+  return input.presentation?.messageId === SUCCESSFUL_RUN_HANDOFF_NOTICE_MESSAGE_ID ||
+    isSuccessfulRunHandoffRequiredNoticeBody(input.body);
 }
 
 export function buildSuccessfulRunHandoffRequiredNotice(input: {
@@ -183,7 +196,8 @@ export function buildSuccessfulRunHandoffRequiredNotice(input: {
     body: SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
     presentation: systemNoticePresentation({
       tone: "warning",
-      title: "Missing issue disposition",
+      messageId: SUCCESSFUL_RUN_HANDOFF_NOTICE_MESSAGE_ID,
+      title: translateServerMessage(SUCCESSFUL_RUN_HANDOFF_NOTICE_MESSAGE_ID),
     }),
     metadata: {
       version: 1,

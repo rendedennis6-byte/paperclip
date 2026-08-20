@@ -1018,6 +1018,8 @@ export interface IssueCommentMetadata {
 export interface IssueCommentPresentation {
   kind: IssueCommentPresentationKind;
   tone: IssueCommentPresentationTone;
+  /** Stable semantic identifier; renderers localize this instead of parsing title text. */
+  messageId?: string | null;
   title?: string | null;
   detailsDefaultOpen: boolean;
   density?: IssueCommentPresentationDensity;

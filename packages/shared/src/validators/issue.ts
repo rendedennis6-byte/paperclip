@@ -586,6 +586,7 @@ export const issueCommentAuthorTypeSchema = z.enum(ISSUE_COMMENT_AUTHOR_TYPES);
 export const issueCommentPresentationSchema = z.object({
   kind: z.enum(ISSUE_COMMENT_PRESENTATION_KINDS).default("message"),
   tone: z.enum(ISSUE_COMMENT_PRESENTATION_TONES).default("neutral"),
+  messageId: z.string().trim().min(1).max(160).nullable().optional(),
   title: z.string().trim().min(1).max(160).nullable().optional(),
   detailsDefaultOpen: z.boolean().optional().default(false),
   density: z.enum(ISSUE_COMMENT_PRESENTATION_DENSITIES).optional(),

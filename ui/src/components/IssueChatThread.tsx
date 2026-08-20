@@ -187,6 +187,7 @@ import {
 import { SourceTrustBadge } from "./SourceTrustBadge";
 import { CommentAttributionChip } from "./CommentAttributionChip";
 import { resolveCommentAttribution } from "../lib/comment-attribution";
+import { useTranslation } from "@/i18n";
 
 interface IssueChatMessageContext {
   feedbackDataSharingPreference: FeedbackDataSharingPreference;
@@ -2704,6 +2705,7 @@ function SystemNoticeCommentRow({
   message: ThreadMessage;
   anchorId?: string;
 }) {
+  const { t } = useTranslation();
   const { onImageClick, agentMap, issueStatus, successfulRunHandoff } = useContext(IssueChatCtx);
   const toastActions = useOptionalToastActions();
   const custom = message.metadata.custom as Record<string, unknown>;
@@ -2797,7 +2799,10 @@ function SystemNoticeCommentRow({
   // without `density` (old comments / old data) keep today's full card.
   if (presentation?.density === "compact") {
     const tone = presentation.tone ?? "neutral";
-    const title = systemNoticeLabelForTone(tone, presentation.title);
+    const localizedTitle = presentation.messageId
+      ? t(presentation.messageId, { defaultValue: presentation.title ?? presentation.messageId })
+      : presentation.title;
+    const title = systemNoticeLabelForTone(tone, localizedTitle);
     return (
       <CompactSystemNoticeRow
         anchorId={anchorId}
