@@ -2743,8 +2743,22 @@ function SystemNoticeCommentRow({
     return undefined;
   })();
 
+  // Localize the notice title from its stable `messageId` before it reaches
+  // either render path. Previously only the compact branch localized, so the
+  // full card (notices without `density`, e.g. the successful-run handoff hint)
+  // stayed in the source English. Apply it once here so full card and compact
+  // share the same localized title.
+  const localizedPresentation = presentation && presentation.messageId
+    ? {
+        ...presentation,
+        title: t(presentation.messageId, {
+          defaultValue: presentation.title ?? presentation.messageId,
+        }),
+      }
+    : presentation;
+
   const props = buildSystemNoticeProps({
-    presentation,
+    presentation: localizedPresentation,
     metadata: commentMetadata,
     body: (
       <MarkdownBody className="text-sm leading-6" softBreaks onImageClick={onImageClick}>
