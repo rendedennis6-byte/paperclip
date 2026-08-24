@@ -76,6 +76,7 @@ import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
+import { waitForEmbeddedPostgresPort } from "./embedded-postgres-port.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
@@ -452,11 +453,19 @@ export async function startServer(): Promise<StartedServer> {
           `Embedded PostgreSQL appears to already be reachable without a pid file; reusing existing server on configured port ${configuredPort}`,
         );
       } catch {
-        const detectedPort = await detectPort(configuredPort);
-        if (detectedPort !== configuredPort) {
-          logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
+        const portResolution = await waitForEmbeddedPostgresPort(configuredPort, {
+          detectAvailablePort: detectPort,
+        });
+        if (portResolution.timedOut) {
+          logger.error(
+            `Embedded PostgreSQL configured port remained busy after timeout; using fallback port (requestedPort=${configuredPort}, selectedPort=${portResolution.port}, waitedMs=${portResolution.waitedMs})`,
+          );
+        } else if (portResolution.waitedMs > 0) {
+          logger.info(
+            `Embedded PostgreSQL configured port became available after waiting (port=${configuredPort}, waitedMs=${portResolution.waitedMs})`,
+          );
         }
-        port = detectedPort;
+        port = portResolution.port;
         logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
         embeddedPostgres = new EmbeddedPostgres({
           databaseDir: dataDir,
