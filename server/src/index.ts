@@ -30,6 +30,7 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
+import { waitForPortAvailable } from "./port-availability.js";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
@@ -258,19 +259,6 @@ export async function startServer(): Promise<StartedServer> {
     }
   }
 
-  function rewriteLocalUrlPort(rawUrl: string | undefined, port: number): string | undefined {
-    if (!rawUrl) return undefined;
-    try {
-      const parsed = new URL(rawUrl);
-      // The URL API normalizes default ports like :80/:443 to "", so treat them as stable URLs.
-      if (!parsed.port) return rawUrl;
-      parsed.port = String(port);
-      return parsed.toString();
-    } catch {
-      return rawUrl;
-    }
-  }
-  
   const LOCAL_BOARD_USER_ID = "local-board";
   const LOCAL_BOARD_USER_EMAIL = "local@paperclip.local";
   const LOCAL_BOARD_USER_NAME = "Board";
@@ -452,11 +440,30 @@ export async function startServer(): Promise<StartedServer> {
           `Embedded PostgreSQL appears to already be reachable without a pid file; reusing existing server on configured port ${configuredPort}`,
         );
       } catch {
-        const detectedPort = await detectPort(configuredPort);
-        if (detectedPort !== configuredPort) {
-          logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
+        // Wait for the CONFIGURED port to free up (an old postmaster often
+        // releases it a few seconds after a service restart) instead of
+        // silently drifting to a different port, which breaks every consumer
+        // that references the configured port. Only fall back after the
+        // timeout, and then loudly at ERROR level. See RENA-57494 / RENA-57511.
+        const availability = await waitForPortAvailable(
+          configuredPort,
+          (candidate) => detectPort(candidate),
+        );
+        if (availability.status === "available") {
+          port = configuredPort;
+        } else {
+          const detectedPort = await detectPort(configuredPort);
+          logger.error(
+            {
+              requestedPort: configuredPort,
+              selectedPort: detectedPort,
+              waitedMs: availability.waitedMs,
+              attempts: availability.attempts,
+            },
+            `Embedded PostgreSQL configured port ${configuredPort} still in use after ${availability.waitedMs}ms; falling back to free port ${detectedPort}`,
+          );
+          port = detectedPort;
         }
-        port = detectedPort;
         logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
         embeddedPostgres = new EmbeddedPostgres({
           databaseDir: dataDir,
@@ -549,10 +556,21 @@ export async function startServer(): Promise<StartedServer> {
   }
 
   const requestedListenPort = config.port;
-  const listenPort = await detectPort(requestedListenPort);
-  if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
-    config.authPublicBaseUrl = rewriteLocalUrlPort(config.authPublicBaseUrl, listenPort);
+  // Wait for the configured HTTP port instead of drifting to a substitute.
+  // If it stays busy past the timeout we hard-fail rather than silently
+  // rewriting the public base URL onto a different port. See RENA-57511.
+  const listenAvailability = await waitForPortAvailable(
+    requestedListenPort,
+    (candidate) => detectPort(candidate),
+  );
+  if (listenAvailability.status !== "available") {
+    throw new Error(
+      `HTTP server port ${requestedListenPort} is still in use after ${listenAvailability.waitedMs}ms ` +
+        `(last detected free port ${listenAvailability.lastDetectedPort}). Refusing to drift to a different ` +
+        `port; free the configured port or update config.port.`,
+    );
   }
+  const listenPort = requestedListenPort;
   
   let authReady = config.deploymentMode === "local_trusted";
   let betterAuthHandler: RequestHandler | undefined;
