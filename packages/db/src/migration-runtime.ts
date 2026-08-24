@@ -77,6 +77,43 @@ async function findAvailablePort(startPort: number): Promise<number> {
   );
 }
 
+const EMBEDDED_POSTGRES_PORT_WAIT_MS = 60_000;
+const EMBEDDED_POSTGRES_PORT_RETRY_MS = 1_000;
+
+type PreferredPortWaitOptions = {
+  timeoutMs?: number;
+  retryMs?: number;
+  portInUse?: (port: number) => Promise<boolean>;
+  sleep?: (delayMs: number) => Promise<void>;
+  logError?: (message: string) => void;
+};
+
+export async function waitForPreferredEmbeddedPostgresPort(
+  preferredPort: number,
+  options: PreferredPortWaitOptions = {},
+): Promise<number> {
+  const timeoutMs = options.timeoutMs ?? EMBEDDED_POSTGRES_PORT_WAIT_MS;
+  const retryMs = options.retryMs ?? EMBEDDED_POSTGRES_PORT_RETRY_MS;
+  const portInUse = options.portInUse ?? isPortInUse;
+  const sleep = options.sleep ?? ((delayMs) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+  const logError = options.logError ?? console.error;
+  const deadline = Date.now() + timeoutMs;
+
+  while (await portInUse(preferredPort)) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      const fallbackPort = await findAvailablePort(preferredPort + 1);
+      logError(
+        `[ERROR] Embedded PostgreSQL configured port ${preferredPort} remained occupied for ${timeoutMs}ms; falling back to port ${fallbackPort}.`,
+      );
+      return fallbackPort;
+    }
+    await sleep(Math.min(retryMs, remainingMs));
+  }
+
+  return preferredPort;
+}
+
 async function loadEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
   try {
     const mod = await import("embedded-postgres");
@@ -94,7 +131,6 @@ async function ensureEmbeddedPostgresConnection(
 ): Promise<MigrationConnection> {
   const EmbeddedPostgres = await loadEmbeddedPostgresCtor();
   await prepareEmbeddedPostgresNativeRuntime();
-  const selectedPort = await findAvailablePort(preferredPort);
   const postmasterPidFile = path.resolve(dataDir, "postmaster.pid");
   const pgVersionFile = path.resolve(dataDir, "PG_VERSION");
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
@@ -135,6 +171,8 @@ async function ensureEmbeddedPostgresConnection(
       stop: async () => {},
     };
   }
+
+  const selectedPort = await waitForPreferredEmbeddedPostgresPort(preferredPort);
 
   const instance = new EmbeddedPostgres({
     databaseDir: dataDir,
