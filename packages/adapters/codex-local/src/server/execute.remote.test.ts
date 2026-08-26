@@ -99,6 +99,8 @@ describe("codex remote execution", () => {
     await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
     const alternateWorkspaceDir = path.join(rootDir, "alternate-workspace");
     await mkdir(alternateWorkspaceDir, { recursive: true });
+    const resolvedAgentSecret = "resolved-agent-secret-fixture";
+    const invocationMeta: Array<{ env?: Record<string, string> }> = [];
 
     await execute({
       runId: "run-1",
@@ -119,6 +121,9 @@ describe("codex remote execution", () => {
         command: "codex",
         env: {
           CODEX_HOME: codexHomeDir,
+          AGENT_SECRET_VALUE: resolvedAgentSecret,
+          PAPERCLIP_API_KEY: "forbidden-config-token",
+          PAPERCLIP_API_URL: "http://forbidden-config:9999",
         },
       },
       context: {
@@ -160,6 +165,9 @@ describe("codex remote execution", () => {
         },
       },
       onLog: async () => {},
+      onMeta: async (meta) => {
+        invocationMeta.push(meta);
+      },
     });
 
     expect(prepareWorkspaceForSshExecution).toHaveBeenCalledTimes(1);
@@ -204,7 +212,17 @@ describe("codex remote execution", () => {
       },
     ]);
     expect(call?.[3].env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:4310");
+    expect(call?.[3].env.PAPERCLIP_API_KEY).toBe("bridge-token");
     expect(call?.[3].env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+    // Server-resolved secret_ref values arrive in adapter config as strings.
+    // They must reach the child process, while invocation metadata only gets
+    // the redacted form and Paperclip-managed runtime values remain authoritative.
+    expect(call?.[3].env.AGENT_SECRET_VALUE).toBe(resolvedAgentSecret);
+    expect(invocationMeta).toHaveLength(1);
+    expect(invocationMeta[0]?.env?.AGENT_SECRET_VALUE).toBe("***REDACTED***");
+    expect(JSON.stringify(invocationMeta)).not.toContain(resolvedAgentSecret);
+    expect(JSON.stringify(invocationMeta)).not.toContain("forbidden-config-token");
+    expect(JSON.stringify(invocationMeta)).not.toContain("http://forbidden-config:9999");
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
     expect(startAdapterExecutionTargetPaperclipBridge).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
