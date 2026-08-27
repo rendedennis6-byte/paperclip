@@ -849,6 +849,10 @@ const activeRunExecutions = new Set<string>();
 // that must guarantee no run write is still in flight (graceful shutdown, and
 // tests tearing down a shared database) can await drainActiveRunExecutions().
 const activeRunExecutionPromises = new Set<Promise<void>>();
+// PID-less adapters can be remote, plugin-backed, or still starting their
+// runtime. Never infer process loss for them from an old row alone until this
+// minimum quiet period has elapsed.
+const PIDLESS_ORPHAN_GRACE_MS = 5 * 60 * 1000;
 // Routes dispatch a wakeup fire-and-forget (void heartbeat.wakeup(...)). The
 // wakeup promise stays pending through its asynchronous prologue, and it
 // resolves only after it inserts the queued run and registers the run
@@ -13688,15 +13692,73 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ]),
     );
 
+    const activeContinuationSourceRunIds = new Set(
+      (await db
+        .select({ retryOfRunId: heartbeatRuns.retryOfRunId })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.status, ["scheduled_retry", "queued", "running"])))
+        .flatMap((candidate) => candidate.retryOfRunId ? [candidate.retryOfRunId] : []),
+    );
+
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
-      // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
-        const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
-        if (now.getTime() - refTime < staleThresholdMs) continue;
+      const hasProcessMetadata = Boolean(run.processPid || run.processGroupId);
+      const runtimeStatus = getHeartbeatRunRuntimeStatus(run.id, {
+        companyId: run.companyId,
+        agentId: run.agentId,
+        now,
+      });
+      if (runtimeStatus) continue;
+      if (activeContinuationSourceRunIds.has(run.id)) continue;
+
+      // An accepted interaction continuation is durable proof that a run was
+      // dispatched to resume work. Verify the interaction row instead of
+      // trusting context alone, so generic PID-less runs keep their grace.
+      const runContext = parseObject(run.contextSnapshot);
+      const interactionId = readNonEmptyString(runContext.interactionId);
+      const issueId = readNonEmptyString(runContext.issueId);
+      let confirmedAcceptedInteractionContinuation = false;
+      if (
+        !hasProcessMetadata &&
+        interactionId &&
+        issueId &&
+        readNonEmptyString(runContext.wakeReason) === "issue_commented" &&
+        readNonEmptyString(runContext.mutation) === "interaction" &&
+        readNonEmptyString(runContext.interactionStatus) === "accepted"
+      ) {
+        confirmedAcceptedInteractionContinuation = await db
+          .select({ id: issueThreadInteractions.id })
+          .from(issueThreadInteractions)
+          .where(
+            and(
+              eq(issueThreadInteractions.id, interactionId),
+              eq(issueThreadInteractions.companyId, run.companyId),
+              eq(issueThreadInteractions.issueId, issueId),
+              eq(issueThreadInteractions.status, "accepted"),
+              inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
+            ),
+          )
+          .then((rows) => rows.length > 0);
+      }
+
+      // Apply the ordinary threshold to PID-backed runs. PID-less runs get a
+      // minimum grace window and use all observable activity timestamps.
+      const effectiveStaleThresholdMs = hasProcessMetadata
+        ? staleThresholdMs
+        : confirmedAcceptedInteractionContinuation
+          ? staleThresholdMs
+          : Math.max(staleThresholdMs, PIDLESS_ORPHAN_GRACE_MS);
+      if (effectiveStaleThresholdMs > 0) {
+        const refTime = Math.max(
+          run.updatedAt ? new Date(run.updatedAt).getTime() : 0,
+          run.lastOutputAt ? new Date(run.lastOutputAt).getTime() : 0,
+          run.startedAt ? new Date(run.startedAt).getTime() : 0,
+          run.createdAt ? new Date(run.createdAt).getTime() : 0,
+        );
+        if (now.getTime() - refTime < effectiveStaleThresholdMs) continue;
       }
 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
@@ -13739,7 +13801,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const runContext = parseObject(run.contextSnapshot);
       const monitorIssueId = readNonEmptyString(runContext.issueId);
       const monitorNextCheckAt = monitorIssueId
         ? monitorNextCheckAtByIssue.get(`${run.companyId}:${monitorIssueId}`)
@@ -13748,8 +13809,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         monitorNextCheckAt !== undefined &&
         (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
-      const shouldRetry = (run.processLossRetryCount ?? 0) < 1 && (
-        (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
+      const shouldRetry = !confirmedAcceptedInteractionContinuation &&
+        (run.processLossRetryCount ?? 0) < 1 && (
+        tracksLocalChild ||
         monitorDispatchLostWithoutFutureWake
       );
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
@@ -13764,7 +13826,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         : null;
 
-      let finalizedRun = await setRunStatus(run.id, "failed", {
+      const terminalWrite = await setRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -13787,12 +13849,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : result;
         })(),
       });
+      // Another finalizer or reaper won the claim. It owns lock release and any
+      // bounded continuation, so this pass must not create a parallel run.
+      if (!terminalWrite.updated || !terminalWrite.run) continue;
+      let finalizedRun = terminalWrite.run;
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
-      if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       await releaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,

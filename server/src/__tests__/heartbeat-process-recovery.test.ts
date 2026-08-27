@@ -106,6 +106,7 @@ import {
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
+import { setHeartbeatRunRuntimeStatus } from "../services/heartbeat-run-runtime-status.ts";
 import {
   readHotRestartIntent,
   resolveLegacyHotRestartIntentPath,
@@ -1202,6 +1203,84 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run).toMatchObject({ status: "failed", error: "Adapter failed" });
     expect(runtime?.lastError).toBe("Adapter failed");
     expect(agent).toEqual({ status: "error", errorReason: "Adapter failed" });
+  });
+
+  it("keeps a fresh PID-less adapter run inside the grace period", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+    });
+    const now = new Date();
+    await db.update(heartbeatRuns).set({ startedAt: now, updatedAt: now }).where(eq(heartbeatRuns.id, runId));
+
+    const result = await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 });
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    expect((await heartbeatService(db).getRun(runId))?.status).toBe("running");
+  });
+
+  it("keeps a PID-less adapter run with fresh output", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+    });
+    await db.update(heartbeatRuns).set({ lastOutputAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+
+    const result = await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 });
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    expect((await heartbeatService(db).getRun(runId))?.status).toBe("running");
+  });
+
+  it("keeps a PID-less adapter run with fresh runtime liveness", async () => {
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+    });
+    setHeartbeatRunRuntimeStatus({
+      companyId,
+      issueId: null,
+      agentId,
+      runId,
+      phase: "run_activity",
+      message: "Remote adapter still working",
+    });
+
+    const result = await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 });
+
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+    expect((await heartbeatService(db).getRun(runId))?.status).toBe("running");
+  });
+
+  it("allows only one continuation when concurrent reapers claim a stale PID-less local run", async () => {
+    const { agentId, runId } = await seedRunFixture({
+      adapterType: "codex_local",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+    });
+    const staleAt = new Date(Date.now() - 10 * 60 * 1000);
+    await db.update(heartbeatRuns).set({
+      createdAt: staleAt,
+      startedAt: staleAt,
+      updatedAt: staleAt,
+      lastOutputAt: null,
+    }).where(eq(heartbeatRuns.id, runId));
+
+    await Promise.all([
+      heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 }),
+      heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 }),
+    ]);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.filter((run) => run.retryOfRunId === runId)).toHaveLength(1);
+    expect(runs.find((run) => run.id === runId)).toMatchObject({ status: "failed", errorCode: "process_lost" });
   });
 
   it("keeps a local run active when the recorded pid is still alive", async () => {
