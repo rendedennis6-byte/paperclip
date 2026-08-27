@@ -8,6 +8,7 @@ import {
   costEvents,
   heartbeatRuns,
   issueComments,
+  issueThreadInteractions,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -472,6 +473,25 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       )
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(MAX_RUNS_FOR_STREAK);
+
+    const hasActiveRun = latestRuns.some((run) =>
+      ACTIVE_RUN_STATUSES.includes(run.status as (typeof ACTIVE_RUN_STATUSES)[number]),
+    );
+    if (sourceIssue.status === "in_progress" && !hasActiveRun) {
+      const pendingInteraction = await db
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, sourceIssue.companyId),
+            eq(issueThreadInteractions.issueId, sourceIssue.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (pendingInteraction) return null;
+    }
 
     const runIds = latestRuns.map((run) => run.id);
     const commentRunIds = new Set<string>();

@@ -8,6 +8,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -178,6 +179,40 @@ describeEmbeddedPostgres("productivity review service", () => {
       ))
       .orderBy(issueComments.createdAt);
   }
+
+  it("does not flag a pending-interaction wait as long-active work", async () => {
+    const now = new Date("2026-04-28T20:00:00.000Z");
+    const fixture = await seedAssignedIssue({
+      startedAt: new Date("2026-04-28T10:00:00.000Z"),
+    });
+    await insertRuns({
+      companyId: fixture.companyId,
+      agentId: fixture.coderId,
+      issueId: fixture.issueId,
+      count: 1,
+      now: new Date("2026-04-28T10:05:00.000Z"),
+      withRunComments: true,
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId: fixture.companyId,
+      issueId: fixture.issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "board_only",
+      effectiveResolverPolicy: "board_only",
+      createdByAgentId: fixture.coderId,
+      payload: { version: 1, prompt: "Approve continuing this contact thread?" },
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      thresholds: { longActiveMs: 60 * 60 * 1000 },
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(fixture.companyId)).toHaveLength(0);
+  });
 
   it("creates exactly one manager-assigned review for a no-comment run streak and rate-limits immediate refresh", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");

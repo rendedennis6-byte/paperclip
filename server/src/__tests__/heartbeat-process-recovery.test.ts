@@ -4878,10 +4878,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it.each([
     "wake_assignee",
     "wake_assignee_on_accept",
-  ] as const)("skips stranded recovery when a pending %s interaction exists", async (continuationPolicy) => {
+  ] as const)("parks a reusable contact thread waiting on a pending %s interaction", async (continuationPolicy) => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
-      runStatus: "failed",
+      runStatus: "succeeded",
+      livenessState: "needs_followup",
     });
 
     await db.insert(issueThreadInteractions).values({
@@ -4890,8 +4891,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       kind: "request_confirmation",
       status: "pending",
       continuationPolicy,
+      requestedResolverPolicy: "board_only",
+      effectiveResolverPolicy: "board_only",
       createdByAgentId: agentId,
-      payload: { version: 1, prompt: "Approve the plan?" },
+      payload: { version: 1, prompt: "Continue this reusable contact thread?" },
     });
 
     const heartbeat = heartbeatService(db);
@@ -4899,14 +4902,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     expect(result.continuationRequeued).toBe(0);
     expect(result.escalated).toBe(0);
-    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(result.pendingInteractionWaitsParked).toBe(1);
+    expect(result.issueIds).toContain(issueId);
 
-    const issue = await db
-      .select()
-      .from(issues)
-      .where(eq(issues.id, issueId))
-      .then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("in_progress");
+    const [issue, interaction, runs] = await Promise.all([
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null),
+      db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId)).then((rows) => rows[0] ?? null),
+      db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)),
+    ]);
+    expect(issue?.status).toBe("in_review");
+    expect(interaction?.status).toBe("pending");
+    expect(interaction?.continuationPolicy).toBe(continuationPolicy);
+    expect(runs).toHaveLength(1);
   });
 
   it("requeues accepted interaction continuations stranded in_review without execution state", async () => {

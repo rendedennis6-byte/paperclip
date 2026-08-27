@@ -949,6 +949,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => Boolean(rows[0]));
   }
 
+  async function hasPendingConfirmationInteraction(companyId: string, issueId: string) {
+    return db
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, companyId),
+          eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.status, "pending"),
+          inArray(issueThreadInteractions.kind, ["request_confirmation", "request_checkbox_confirmation"]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
   async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect) {
     if (issue.monitorNextCheckAt) return true;
 
@@ -3680,6 +3696,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       waitingOnReviewResolved: 0,
       providerQuotaMonitored: 0,
+      pendingInteractionWaitsParked: 0,
       recentProgressExempted: 0,
       operatorCancelExempted: 0,
       skipped: 0,
@@ -3760,7 +3777,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+      if (await hasPendingConfirmationInteraction(issue.companyId, issue.id)) {
+        if (issue.status === "in_progress") {
+          const parked = await db
+            .update(issues)
+            .set({ status: "in_review", updatedAt: new Date() })
+            .where(
+              and(
+                eq(issues.id, issue.id),
+                eq(issues.companyId, issue.companyId),
+                eq(issues.status, "in_progress"),
+              ),
+            )
+            .returning({ id: issues.id })
+            .then((rows) => rows[0] ?? null);
+          if (parked) {
+            result.pendingInteractionWaitsParked += 1;
+            result.issueIds.push(issue.id);
+            await logActivity(db, {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "recovery",
+              agentId,
+              action: "issue.pending_interaction_wait_parked",
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                source: "recovery.reconcile_stranded_assigned_issues",
+                previousStatus: "in_progress",
+                status: "in_review",
+              },
+            });
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
         result.skipped += 1;
         continue;
       }

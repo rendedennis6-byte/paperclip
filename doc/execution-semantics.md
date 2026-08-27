@@ -86,6 +86,8 @@ This requirement is prospective-only on rollout: it applies to transitions into 
 
 Execution work is paused because the next move belongs to a reviewer or approver, not the current executor.
 
+When an agent-owned issue has no active or queued execution and a pending issue-thread interaction, Paperclip durably parks the issue in `in_review`. The interaction remains pending and unchanged; accepting, rejecting, or superseding it continues to follow its existing continuation and wake policy. A healthy pending-interaction wait is not long-active productive work and must not trigger a productivity review.
+
 An external review service can also be a valid review path when the issue keeps an agent assignee and has an active one-shot monitor that will wake that assignee to check the service later.
 
 ### `done`
