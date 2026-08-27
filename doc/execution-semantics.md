@@ -679,6 +679,12 @@ Task watchdogs must not silently mark source work done from prose comments, must
 
 ## 12. Silent Active-Run Watchdog
 
+### Recovery non-recursion and canonical folding
+
+Recovery and review work is never a new domain source of recovery. Scanners and reconcilers follow recovery-origin links until they reach the canonical non-recovery issue; a cycle, cross-company hop, missing source, or depth overflow is suppressed as malformed evidence. They must not create recovery-on-recovery trees.
+
+An open recovery/review action is identified by `(canonical source issue, signal family, dominant preflight cause, workspace)`. Repeated observations reuse that action idempotently, including observations emitted by a run whose immediate issue is itself a productivity review or stale-run evaluation. Canonical folding may resolve or refresh recovery metadata, but it must never fold, cancel, interrupt, or stop a productive domain run.
+
 An active run can still be unhealthy even when its process is `running`. Paperclip treats prolonged output silence as a watchdog signal, not as proof that the run is failed.
 
 The recovery service owns this contract:

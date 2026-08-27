@@ -21,7 +21,7 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
-import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { RECOVERY_ORIGIN_KINDS, recoveryActionFingerprint, resolveCanonicalRecoverySourceIssue } from "./recovery/origins.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -103,8 +103,13 @@ type EnqueueWakeup = (
   },
 ) => Promise<unknown | null>;
 
-function productivityReviewFingerprint(sourceIssueId: string) {
-  return `productivity-review:${sourceIssueId}`;
+function productivityReviewFingerprint(sourceIssue: IssueRow, trigger: ProductivityReviewTrigger) {
+  return recoveryActionFingerprint({
+    sourceIssueId: sourceIssue.id,
+    signalFamily: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+    dominantPreflightCause: trigger,
+    workspaceId: sourceIssue.executionWorkspaceId ?? sourceIssue.projectWorkspaceId,
+  });
 }
 
 function issueRunScopeSql(issueId: string) {
@@ -794,7 +799,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
         originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
         originId: evidence.sourceIssue.id,
-        originFingerprint: productivityReviewFingerprint(evidence.sourceIssue.id),
+        originFingerprint: productivityReviewFingerprint(evidence.sourceIssue, evidence.trigger),
         requestDepth: clampIssueRequestDepth(evidence.sourceIssue.requestDepth + 1),
       });
     } catch (error) {
@@ -903,7 +908,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         result.skipped += 1;
         continue;
       }
-      if (await isProductivityReviewDescendant(candidate)) {
+      const canonicalSource = await resolveCanonicalRecoverySourceIssue(db, candidate);
+      if (!canonicalSource || canonicalSource.id !== candidate.id || await isProductivityReviewDescendant(candidate)) {
         result.skipped += 1;
         continue;
       }

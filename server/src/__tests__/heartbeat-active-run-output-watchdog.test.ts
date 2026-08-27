@@ -258,7 +258,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
   it("creates one medium-priority evaluation issue for a suspicious silent run", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, managerId, runId } = await seedRunningRun({
+    const { companyId, managerId, issueId, runId } = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
     });
@@ -282,7 +282,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       assigneeAgentId: managerId,
       assigneeAdapterOverrides: { modelProfile: "cheap" },
       originId: runId,
-      originFingerprint: `stale_active_run:${companyId}:${runId}`,
+      originFingerprint: `recovery-action:${issueId}:stale_active_run_evaluation:output_silence:none`,
     });
     expect(evaluations[0]?.description).toContain("Decision Checklist");
     expect(evaluations[0]?.description).not.toContain("sk-test-secret-value");

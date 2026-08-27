@@ -72,6 +72,8 @@ import {
   buildIssueGraphLivenessLeafKey,
   isStrandedIssueRecoveryOriginKind,
   parseIssueGraphLivenessIncidentKey,
+  recoveryActionFingerprint,
+  resolveCanonicalRecoverySourceIssue,
 } from "./origins.js";
 import {
   classifyIssueGraphLiveness,
@@ -1350,8 +1352,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0]?.issuePrefix ?? "PAP");
   }
 
-  function staleActiveRunOriginFingerprint(companyId: string, runId: string) {
-    return `stale_active_run:${companyId}:${runId}`;
+  function staleActiveRunOriginFingerprint(sourceIssue: typeof issues.$inferSelect | null) {
+    return recoveryActionFingerprint({
+      sourceIssueId: sourceIssue?.id ?? "unscoped",
+      signalFamily: STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND,
+      dominantPreflightCause: "output_silence",
+      workspaceId: sourceIssue?.executionWorkspaceId ?? sourceIssue?.projectWorkspaceId,
+    });
   }
 
   function isTerminalIssueStatus(status: string | null | undefined) {
@@ -1390,7 +1397,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return row ?? null;
   }
 
-  async function findOpenStaleRunEvaluation(companyId: string, runId: string) {
+  async function findOpenStaleRunEvaluation(companyId: string, runId: string, sourceIssue?: typeof issues.$inferSelect | null) {
     const [row] = await db
       .select({
         id: issues.id,
@@ -1405,7 +1412,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           eq(issues.companyId, companyId),
           eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
-          eq(issues.originId, runId),
+          sourceIssue
+            ? or(
+                eq(issues.originFingerprint, staleActiveRunOriginFingerprint(sourceIssue)),
+                eq(issues.originId, runId),
+              )
+            : eq(issues.originId, runId),
           visibleIssueCondition(),
           notInArray(issues.status, ["done", "cancelled"]),
         ),
@@ -2083,28 +2095,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
-    const sourceIssue = await resolveStaleRunSourceIssue(input.run);
-    const existing = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
-    if (sourceIssue && isRecoveryOriginIssue(sourceIssue)) {
-      await logActivity(db, {
-        companyId: input.run.companyId,
-        actorType: "system",
-        actorId: "system",
-        agentId: input.run.agentId,
-        runId: input.run.id,
-        action: "heartbeat.output_stale_recovery_recursion_refused",
-        entityType: "heartbeat_run",
-        entityId: input.run.id,
-        details: {
-          source: "recovery.scan_silent_active_runs",
-          sourceIssueId: sourceIssue.id,
-          sourceIssueIdentifier: sourceIssue.identifier,
-          sourceIssueOriginKind: sourceIssue.originKind,
-          existingEvaluationIssueId: existing?.id ?? null,
-        },
-      });
-      return { kind: "skipped" as const };
-    }
+    const linkedIssue = await resolveStaleRunSourceIssue(input.run);
+    const sourceIssue = await resolveCanonicalRecoverySourceIssue(db, linkedIssue);
+    if (linkedIssue && !sourceIssue) return { kind: "skipped" as const };
+    const existing = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id, sourceIssue);
     const silenceStartedAt = silenceStartedAtForRun(input.run);
     if (sourceIssue && isTerminalIssueStatus(sourceIssue.status)) {
       const terminalEvidence = await latestSameRunSourceTerminalEvidence({
@@ -2248,11 +2242,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         originKind: STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND,
         originId: input.run.id,
         originRunId: input.run.id,
-        originFingerprint: staleActiveRunOriginFingerprint(input.run.companyId, input.run.id),
+        originFingerprint: staleActiveRunOriginFingerprint(sourceIssue),
       });
     } catch (error) {
       if (!isUniqueStaleRunEvaluationConflict(error)) throw error;
-      const raced = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
+      const raced = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id, sourceIssue);
       if (!raced) throw error;
       return { kind: "existing" as const, evaluationIssueId: raced.id };
     }
