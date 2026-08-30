@@ -1069,9 +1069,6 @@ export async function startServer(): Promise<StartedServer> {
     server.listen(listenPort, config.host, () => {
       server.off("error", onError);
       logger.info(`Server listening on ${config.host}:${listenPort}`);
-      void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
-        if (notified) logger.info("Notified systemd that Paperclip is ready");
-      });
       resolveListen();
     });
   });
@@ -1232,6 +1229,13 @@ export async function startServer(): Promise<StartedServer> {
   };
   process.once("SIGINT", () => requestShutdown("SIGINT"));
   process.once("SIGTERM", () => requestShutdown("SIGTERM"));
+  // READY is emitted only after the listener has bound and the early,
+  // recovery-safe shutdown path is installed. A supervisor may issue SIGTERM
+  // immediately after observing readiness; signalling sooner would bypass the
+  // coordinated teardown during this post-listen initialization window.
+  void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
+    if (notified) logger.info("Notified systemd that Paperclip is ready");
+  });
 
   if (heartbeat) {
     const secretProposals = createSecretProposalsService(db as any);
