@@ -203,6 +203,29 @@ describe("loadWithoutCoordinatedShutdownSignalHooks", () => {
 });
 
 describe("coordinateHeartbeatSchedulerShutdown", () => {
+  it("bounds SIGTERM quiescence when startup recovery never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const prepareHotRestartShutdown = vi.fn();
+      const shutdown = coordinateHeartbeatSchedulerShutdown({
+        signal: "SIGTERM",
+        prepareHotRestartShutdown,
+        waitForHeartbeatSchedulerIdle: () => new Promise<void>(() => undefined),
+        schedulerIdleTimeoutMs: 5_000,
+      });
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(shutdown).resolves.toEqual({
+        hotRestart: null,
+        preparationError: null,
+        waitedForSchedulerIdle: false,
+      });
+      expect(prepareHotRestartShutdown).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("quiesces active scheduler work before capturing a hot-restart snapshot", async () => {
     let snapshotCaptured = false;
     let releaseScheduler!: () => void;

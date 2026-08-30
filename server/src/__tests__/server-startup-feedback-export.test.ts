@@ -397,9 +397,13 @@ describe("startServer feedback export wiring", () => {
       return { reaped: 1, runIds: ["synthetic-running-run"] };
     });
     heartbeatServiceMock.resumeQueuedRuns.mockImplementationOnce(async () => {
-      // Represents the recovered queued run reaching the sandbox callback
-      // bridge. The listener must already exist at this point.
-      expect(actualServer?.listening).toBe(true);
+      // Exercise the callback's actual HTTP path, not only the server state.
+      const address = actualServer?.address();
+      if (!address || typeof address === "string") throw new Error("callback ran before listener binding");
+      const callback = await fetch(`http://127.0.0.1:${address.port}/api/health`, {
+        signal: AbortSignal.timeout(250),
+      });
+      expect(callback.status).toBe(200);
     });
 
     const startup = startServer();

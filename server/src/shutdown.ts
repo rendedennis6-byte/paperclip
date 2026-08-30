@@ -108,6 +108,7 @@ export async function coordinateHeartbeatSchedulerShutdown<
   signal: "SIGINT" | "SIGTERM";
   prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<TPreparation>) | null;
   waitForHeartbeatSchedulerIdle: () => Promise<void>;
+  schedulerIdleTimeoutMs?: number;
 }): Promise<{
   hotRestart: TPreparation | null;
   preparationError: unknown;
@@ -120,7 +121,23 @@ export async function coordinateHeartbeatSchedulerShutdown<
   // Quiesce any callback that was already in flight before querying running
   // rows for the shutdown snapshot, otherwise a late queue claim can create a
   // run that is absent from both the snapshot and the selective drain set.
-  await input.waitForHeartbeatSchedulerIdle();
+  let waitedForSchedulerIdle = true;
+  if (input.schedulerIdleTimeoutMs === undefined) {
+    await input.waitForHeartbeatSchedulerIdle();
+  } else {
+    waitedForSchedulerIdle = await Promise.race([
+      input.waitForHeartbeatSchedulerIdle().then(() => true),
+      new Promise<false>((resolve) => {
+        const timeout = setTimeout(() => resolve(false), input.schedulerIdleTimeoutMs);
+        timeout.unref?.();
+      }),
+    ]);
+  }
+
+  // A hot-restart snapshot is only authoritative after scheduler quiescence.
+  if (!waitedForSchedulerIdle) {
+    return { hotRestart: null, preparationError: null, waitedForSchedulerIdle: false };
+  }
 
   if (input.prepareHotRestartShutdown) {
     try {
@@ -133,6 +150,6 @@ export async function coordinateHeartbeatSchedulerShutdown<
   return {
     hotRestart,
     preparationError,
-    waitedForSchedulerIdle: true,
+    waitedForSchedulerIdle,
   };
 }
