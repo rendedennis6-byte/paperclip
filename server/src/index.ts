@@ -1183,11 +1183,20 @@ export async function startServer(): Promise<StartedServer> {
         clearInterval(heartbeatSchedulerInterval);
         heartbeatSchedulerInterval = null;
       }
-      const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
-        signal,
-        prepareHotRestartShutdown,
-        waitForHeartbeatSchedulerIdle,
-      });
+      const heartbeatShutdown = await Promise.race([
+        coordinateHeartbeatSchedulerShutdown({
+          signal,
+          prepareHotRestartShutdown,
+          waitForHeartbeatSchedulerIdle,
+        }),
+        new Promise<Awaited<ReturnType<typeof coordinateHeartbeatSchedulerShutdown>>>((resolveTimeout) => {
+          const timeout = setTimeout(() => {
+            logger.warn({ signal }, "early post-listen scheduler quiescence timed out; continuing shutdown");
+            resolveTimeout({ hotRestart: null, preparationError: null, waitedForSchedulerIdle: false });
+          }, 5_000);
+          timeout.unref?.();
+        }),
+      ]);
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
         try {
