@@ -1045,6 +1045,38 @@ export async function startServer(): Promise<StartedServer> {
     throw err;
   }
 
+  // Adapter registration is part of request/schema validation and must be
+  // complete before the server accepts traffic. Recovery and cleanup below are
+  // deliberately not part of this critical startup boundary: persisted runs
+  // can invoke the sandbox callback bridge, which needs the HTTP listener to be
+  // bound already.
+  const { waitForExternalAdapters } = await import("./adapters/registry.js");
+  await waitForExternalAdapters();
+  try {
+    reconcileAdapterAvailability(parseAdapterRegistryEnv());
+  } catch (err) {
+    logger.error({ err }, "failed to reconcile adapter availability from PAPERCLIP_ADAPTERS");
+    throw err;
+  }
+
+  const listenPromise = new Promise<void>((resolveListen, rejectListen) => {
+    const onError = (err: Error) => {
+      server.off("error", onError);
+      rejectListen(err);
+    };
+
+    server.once("error", onError);
+    server.listen(listenPort, config.host, () => {
+      server.off("error", onError);
+      logger.info(`Server listening on ${config.host}:${listenPort}`);
+      void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
+        if (notified) logger.info("Notified systemd that Paperclip is ready");
+      });
+      resolveListen();
+    });
+  });
+  await listenPromise;
+
   let drainHeartbeatRunsForShutdown: ((
     signal: "SIGINT" | "SIGTERM",
     runIds?: readonly string[] | null,
@@ -1634,88 +1666,52 @@ export async function startServer(): Promise<StartedServer> {
     }, backupIntervalMs);
   }
   
-  // Wait for external adapters to finish loading before accepting requests.
-  // Without this, adapter type validation (assertKnownAdapterType) would
-  // reject valid external adapter types during the startup loading window.
-  const { waitForExternalAdapters } = await import("./adapters/registry.js");
-  await waitForExternalAdapters();
-
-  // Reconcile the agent-creation picker to the declaratively-configured adapter
-  // set (PAPERCLIP_ADAPTERS). Must run after external adapters are loaded so the
-  // known-adapter list is complete. Fail loud on misconfig (a declared adapter
-  // with no implementation), consistent with the execution-policy bootstrap:
-  // log the structured error, then rethrow to fail startup.
-  try {
-    reconcileAdapterAvailability(parseAdapterRegistryEnv());
-  } catch (err) {
-    logger.error({ err }, "failed to reconcile adapter availability from PAPERCLIP_ADAPTERS");
-    throw err;
+  if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {
+    const openHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
+    const url = `http://${openHost}:${listenPort}`;
+    void import("open")
+      .then((mod) => mod.default(url))
+      .then(() => {
+        logger.info(`Opened browser at ${url}`);
+      })
+      .catch((err) => {
+        logger.warn({ err, url }, "Failed to open browser on startup");
+      });
   }
-
-  await new Promise<void>((resolveListen, rejectListen) => {
-    const onError = (err: Error) => {
-      server.off("error", onError);
-      rejectListen(err);
-    };
-
-    server.once("error", onError);
-    server.listen(listenPort, config.host, () => {
-      server.off("error", onError);
-      logger.info(`Server listening on ${config.host}:${listenPort}`);
-      void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {
-        if (notified) logger.info("Notified systemd that Paperclip is ready");
-      });
-      if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {
-        const openHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
-        const url = `http://${openHost}:${listenPort}`;
-        void import("open")
-          .then((mod) => mod.default(url))
-          .then(() => {
-            logger.info(`Opened browser at ${url}`);
-          })
-          .catch((err) => {
-            logger.warn({ err, url }, "Failed to open browser on startup");
-          });
-      }
-        printStartupBanner({
-          bind: config.bind,
-          host: config.host,
-          deploymentMode: config.deploymentMode,
-        deploymentExposure: config.deploymentExposure,
-        authReady,
-        requestedPort: requestedListenPort,
-        listenPort,
-        uiMode,
-        db: startupDbInfo,
-        migrationSummary,
-        heartbeatSchedulerEnabled: config.heartbeatSchedulerEnabled,
-        heartbeatSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
-        databaseBackupEnabled: config.databaseBackupEnabled,
-        databaseBackupIntervalMinutes: config.databaseBackupIntervalMinutes,
-        databaseBackupRetentionDays: config.databaseBackupRetentionDays,
-        databaseBackupDir: config.databaseBackupDir,
-      });
-
-      const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
-      if (boardClaimUrl) {
-        const red = "\x1b[41m\x1b[30m";
-        const yellow = "\x1b[33m";
-        const reset = "\x1b[0m";
-        console.log(
-          [
-            `${red}  BOARD CLAIM REQUIRED  ${reset}`,
-            `${yellow}This instance was previously local_trusted and still has local-board as the only admin.${reset}`,
-            `${yellow}Sign in with a real user and open this one-time URL to claim ownership:${reset}`,
-            `${yellow}${boardClaimUrl}${reset}`,
-            `${yellow}If you are connecting over Tailscale, replace the host in this URL with your Tailscale IP/MagicDNS name.${reset}`,
-          ].join("\n"),
-        );
-      }
-
-      resolveListen();
-    });
+  printStartupBanner({
+    bind: config.bind,
+    host: config.host,
+    deploymentMode: config.deploymentMode,
+    deploymentExposure: config.deploymentExposure,
+    authReady,
+    requestedPort: requestedListenPort,
+    listenPort,
+    uiMode,
+    db: startupDbInfo,
+    migrationSummary,
+    heartbeatSchedulerEnabled: config.heartbeatSchedulerEnabled,
+    heartbeatSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
+    databaseBackupEnabled: config.databaseBackupEnabled,
+    databaseBackupIntervalMinutes: config.databaseBackupIntervalMinutes,
+    databaseBackupRetentionDays: config.databaseBackupRetentionDays,
+    databaseBackupDir: config.databaseBackupDir,
   });
-  
+
+  const boardClaimUrl = getBoardClaimWarningUrl(config.host, listenPort);
+  if (boardClaimUrl) {
+    const red = "\x1b[41m\x1b[30m";
+    const yellow = "\x1b[33m";
+    const reset = "\x1b[0m";
+    console.log(
+      [
+        `${red}  BOARD CLAIM REQUIRED  ${reset}`,
+        `${yellow}This instance was previously local_trusted and still has local-board as the only admin.${reset}`,
+        `${yellow}Sign in with a real user and open this one-time URL to claim ownership:${reset}`,
+        `${yellow}${boardClaimUrl}${reset}`,
+        `${yellow}If you are connecting over Tailscale, replace the host in this URL with your Tailscale IP/MagicDNS name.${reset}`,
+      ].join("\n"),
+    );
+  }
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);

@@ -366,6 +366,34 @@ describe("startServer feedback export wiring", () => {
     process.env.BETTER_AUTH_SECRET = "test-secret";
   });
 
+  it("binds before queued/running heartbeat recovery and its sandbox callbacks", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let releaseReaper!: () => void;
+    const reaperBlocked = new Promise<void>((resolve) => {
+      releaseReaper = resolve;
+    });
+    heartbeatServiceMock.reapOrphanedRuns.mockImplementationOnce(async () => {
+      await reaperBlocked;
+      return { reaped: 1, runIds: ["synthetic-running-run"] };
+    });
+    heartbeatServiceMock.resumeQueuedRuns.mockImplementationOnce(async () => {
+      // Represents the recovered queued run reaching the sandbox callback
+      // bridge. The listener must already exist at this point.
+      expect(fakeServer.listen).toHaveBeenCalledOnce();
+    });
+
+    const startup = startServer();
+    await vi.waitFor(() => expect(fakeServer.listen).toHaveBeenCalledOnce(), { timeout: 250 });
+    expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
+
+    releaseReaper();
+    await startup;
+    expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledOnce();
+  });
+
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
     const originalHome = process.env.PAPERCLIP_HOME;
     const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
