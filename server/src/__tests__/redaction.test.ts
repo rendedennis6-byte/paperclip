@@ -138,6 +138,36 @@ describe("redaction", () => {
     expect(result?.commandArgs).toEqual(["--api-key", REDACTED_EVENT_VALUE, "safe-next"]);
   });
 
+  it("redacts every argv-style environment value regardless of binding name", () => {
+    const canary = "synthetic-runtime-canary";
+    const result = redactEventPayload({
+      argv: [
+        "env",
+        `PROVIDER_SPECIFIC_BINDING=${canary}`,
+        `SAFE_LOOKING_NAME=${canary}`,
+        "runner",
+        "--diagnose",
+      ],
+    });
+
+    expect(JSON.stringify(result)).not.toContain(canary);
+    expect(result?.argv).toEqual([
+      "env",
+      `PROVIDER_SPECIFIC_BINDING=${REDACTED_EVENT_VALUE}`,
+      `SAFE_LOOKING_NAME=${REDACTED_EVENT_VALUE}`,
+      "runner",
+      "--diagnose",
+    ]);
+  });
+
+  it("does not mistake non-assignment argv tokens for environment bindings", () => {
+    const result = redactEventPayload({
+      commandArgs: ["runner", "--filter=status=ready", "not-an-assignment"],
+    });
+
+    expect(result?.commandArgs).toEqual(["runner", "--filter=status=ready", "not-an-assignment"]);
+  });
+
   it("does not treat bare args payloads as command args", () => {
     const result = redactEventPayload({
       args: ["--api-key", "not-a-command-secret"],

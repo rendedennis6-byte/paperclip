@@ -12,6 +12,7 @@ const AUDIT_SURFACE_PAYLOAD_KEY_RE = /^surface$/;
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
+const ENV_ASSIGNMENT_ARG_RE = /^([A-Za-z_][A-Za-z0-9_]*=)([\s\S]*)$/;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 const CLI_SECRET_FLAG_RE = new RegExp(String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`, "i");
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
@@ -91,6 +92,14 @@ function sanitizeCommandArgs(args: unknown[]): unknown[] {
     if (CLI_SECRET_FLAG_RE.test(arg.trim())) {
       redactNext = true;
       return arg;
+    }
+    // Runtime diagnostics must never retain values from argv-style environment
+    // blocks. Redact every NAME=value token, including variables whose names do
+    // not look sensitive: an allowlist-by-name is unsafe because credentials
+    // are routinely carried under provider-specific or operator-defined names.
+    const envAssignment = ENV_ASSIGNMENT_ARG_RE.exec(arg);
+    if (envAssignment) {
+      return `${envAssignment[1]}${REDACTED_EVENT_VALUE}`;
     }
     return redactSensitiveText(arg);
   });

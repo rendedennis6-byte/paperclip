@@ -109,10 +109,31 @@ describe("buildInvocationEnvForLogs", () => {
       },
     );
 
-    expect(loggedEnv.SAFE_VALUE).toBe("visible");
+    expect(loggedEnv.SAFE_VALUE).toBe("***REDACTED***");
     expect(loggedEnv.PAPERCLIP_RESOLVED_COMMAND).toBe(
       "env OPENAI_API_KEY=***REDACTED*** PAPERCLIP_API_KEY='***REDACTED***' custom-acp --paperclip-api-key=***REDACTED*** --token ***REDACTED***",
     );
+  });
+
+  it("uses an allowlist for environment values in invocation diagnostics", () => {
+    const canary = "synthetic-provider-canary";
+    const loggedEnv = buildInvocationEnvForLogs(
+      {
+        PROVIDER_SPECIFIC_BINDING: canary,
+        DISPLAY_ONLY_SETTING: canary,
+      },
+      {
+        runtimeEnv: { HOME: "/home/runner" },
+        includeRuntimeKeys: ["HOME"],
+      },
+    );
+
+    expect(JSON.stringify(loggedEnv)).not.toContain(canary);
+    expect(loggedEnv).toEqual({
+      PROVIDER_SPECIFIC_BINDING: "***REDACTED***",
+      DISPLAY_ONLY_SETTING: "***REDACTED***",
+      HOME: "/home/runner",
+    });
   });
 });
 
