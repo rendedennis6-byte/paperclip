@@ -367,9 +367,26 @@ describe("startServer feedback export wiring", () => {
   });
 
   it("binds before queued/running heartbeat recovery and its sandbox callbacks", async () => {
+    const actualHttp = await vi.importActual<typeof import("node:http")>("node:http");
+    const mockedHttp = await import("node:http");
+    let actualServer: import("node:http").Server | null = null;
+    vi.mocked(mockedHttp.createServer).mockImplementationOnce((handler) => {
+      actualServer = actualHttp.createServer(handler);
+      return actualServer;
+    });
+    createAppMock.mockResolvedValueOnce(((request: { url?: string }, response: {
+      statusCode: number;
+      setHeader(name: string, value: string): void;
+      end(body: string): void;
+    }) => {
+      response.statusCode = request.url === "/api/health" ? 200 : 404;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ status: request.url === "/api/health" ? "ok" : "not_found" }));
+    }) as never);
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: 30000,
+      port: 0,
     }));
     let releaseReaper!: () => void;
     const reaperBlocked = new Promise<void>((resolve) => {
@@ -382,16 +399,24 @@ describe("startServer feedback export wiring", () => {
     heartbeatServiceMock.resumeQueuedRuns.mockImplementationOnce(async () => {
       // Represents the recovered queued run reaching the sandbox callback
       // bridge. The listener must already exist at this point.
-      expect(fakeServer.listen).toHaveBeenCalledOnce();
+      expect(actualServer?.listening).toBe(true);
     });
 
     const startup = startServer();
-    await vi.waitFor(() => expect(fakeServer.listen).toHaveBeenCalledOnce(), { timeout: 250 });
+    await vi.waitFor(() => expect(actualServer?.listening).toBe(true), { timeout: 250 });
+    const address = actualServer?.address();
+    if (!address || typeof address === "string") throw new Error("expected TCP listener address");
+    const health = await fetch(`http://127.0.0.1:${address.port}/api/health`, {
+      signal: AbortSignal.timeout(250),
+    });
+    expect(health.status).toBe(200);
+    await expect(health.json()).resolves.toEqual({ status: "ok" });
     expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
 
     releaseReaper();
     await startup;
     expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledOnce();
+    await new Promise<void>((resolve, reject) => actualServer?.close((error) => error ? reject(error) : resolve()));
   });
 
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
