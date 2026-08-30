@@ -1164,6 +1164,71 @@ export async function startServer(): Promise<StartedServer> {
     trackHeartbeatSchedulerWork(runEnvironmentLeaseCleanupSweep(ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS));
   };
 
+  // Install signal handling before any post-listen recovery can block. Until
+  // the full heartbeat-aware shutdown path is initialized below, the fallback
+  // still closes the listener and tears down application/provider resources.
+  let shutdownServer: ((signal: "SIGINT" | "SIGTERM") => Promise<void>) | null = null;
+  let shutdownStarted = false;
+  const requestShutdown = (signal: "SIGINT" | "SIGTERM") => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    if (shutdownServer) {
+      void shutdownServer(signal);
+      return;
+    }
+    void (async () => {
+      await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+      heartbeatSchedulerStopped = true;
+      if (heartbeatSchedulerInterval) {
+        clearInterval(heartbeatSchedulerInterval);
+        heartbeatSchedulerInterval = null;
+      }
+      const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
+        signal,
+        prepareHotRestartShutdown,
+        waitForHeartbeatSchedulerIdle,
+      });
+      const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+      if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
+        try {
+          await drainHeartbeatRunsForShutdown(signal, heartbeatShutdown.hotRestart?.drainRunIds ?? null);
+        } catch (err) {
+          logger.error({ err, signal }, "early post-listen heartbeat run drain failed");
+        }
+      }
+      const telemetryClient = getTelemetryClient();
+      if (telemetryClient) {
+        telemetryClient.stop();
+        await telemetryClient.flush();
+      }
+      try {
+        await flushInFlightRunLogMirrors();
+      } catch (err) {
+        logger.error({ err, signal }, "early post-listen run-log mirror flush failed");
+      }
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
+        ?.paperclipShutdown;
+      const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
+        ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
+        : null;
+      await finalizeServerShutdown({
+        signal,
+        shutdownAppServices: appShutdown,
+        stopEmbeddedPostgres,
+        shutdownInstrumentation,
+        shutdownSentry,
+        log: logger,
+      });
+      process.exit(0);
+    })().catch((err) => {
+      logger.error({ err, signal }, "early post-listen shutdown failed");
+      process.exit(1);
+    });
+  };
+  process.once("SIGINT", () => requestShutdown("SIGINT"));
+  process.once("SIGTERM", () => requestShutdown("SIGTERM"));
+
   if (heartbeat) {
     const secretProposals = createSecretProposalsService(db as any);
     const decisionExecutor = decisionService(db as any, decisionServiceOptions);
@@ -1406,16 +1471,24 @@ export async function startServer(): Promise<StartedServer> {
       await startupHeartbeatRecovery;
     }
 
-    const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
+    const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions().catch((err) => {
+      logger.error({ err }, "startup environment customImage setup cleanup failed");
+      return { scanned: 0, timedOut: 0, failed: 1 };
+    });
     if (setupCleanup.timedOut > 0 || setupCleanup.failed > 0) {
       logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
     }
 
-    const toolHealthSweep = await tools.sweepConnectionHealth();
+    const toolHealthSweep = await tools.sweepConnectionHealth().catch((err) => {
+      logger.error({ err }, "startup tool connection health sweep failed");
+      return { failed: 1 } as Awaited<ReturnType<typeof tools.sweepConnectionHealth>>;
+    });
     if (toolHealthSweep.failed > 0) {
       logger.warn({ ...toolHealthSweep }, "startup tool connection health sweep found failing connections");
     }
-    await decisionExecutor.sweepExpired();
+    await decisionExecutor.sweepExpired().catch((err) => {
+      logger.error({ err }, "startup decision expiry sweep failed");
+    });
 
     // Run the adapter login reaper once at startup, so a login sandbox that
     // outlived a server restart is deleted before timer ticks start.
@@ -1456,7 +1529,9 @@ export async function startServer(): Promise<StartedServer> {
       const notifications = await retentionExecutor.deliverNotifications();
       return { archived, ...notifications };
     };
-    await runRetentionSweep();
+    await runRetentionSweep().catch((err) => {
+      logger.error({ err }, "startup decision retention sweep failed");
+    });
 
     startHeartbeatSchedulerInterval(() => {
       // Track the outer async callback as well as the work it starts. Shutdown
@@ -1713,7 +1788,7 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
   {
-    const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+    shutdownServer = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
       if (heartbeatSchedulerInterval) {
@@ -1786,13 +1861,6 @@ export async function startServer(): Promise<StartedServer> {
 
       process.exit(0);
     };
-
-    process.once("SIGINT", () => {
-      void shutdown("SIGINT");
-    });
-    process.once("SIGTERM", () => {
-      void shutdown("SIGTERM");
-    });
   }
 
   return {

@@ -403,20 +403,26 @@ describe("startServer feedback export wiring", () => {
     });
 
     const startup = startServer();
-    await vi.waitFor(() => expect(actualServer?.listening).toBe(true), { timeout: 250 });
-    const address = actualServer?.address();
-    if (!address || typeof address === "string") throw new Error("expected TCP listener address");
-    const health = await fetch(`http://127.0.0.1:${address.port}/api/health`, {
-      signal: AbortSignal.timeout(250),
-    });
-    expect(health.status).toBe(200);
-    await expect(health.json()).resolves.toEqual({ status: "ok" });
-    expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
+    try {
+      await vi.waitFor(() => expect(actualServer?.listening).toBe(true), { timeout: 250 });
+      const address = actualServer?.address();
+      if (!address || typeof address === "string") throw new Error("expected TCP listener address");
+      const health = await fetch(`http://127.0.0.1:${address.port}/api/health`, {
+        signal: AbortSignal.timeout(250),
+      });
+      expect(health.status).toBe(200);
+      await expect(health.json()).resolves.toEqual({ status: "ok" });
+      expect(heartbeatServiceMock.resumeQueuedRuns).not.toHaveBeenCalled();
 
-    releaseReaper();
-    await startup;
-    expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledOnce();
-    await new Promise<void>((resolve, reject) => actualServer?.close((error) => error ? reject(error) : resolve()));
+      releaseReaper();
+      await startup;
+      expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledOnce();
+    } finally {
+      releaseReaper();
+      if (actualServer?.listening) {
+        await new Promise<void>((resolve, reject) => actualServer?.close((error) => error ? reject(error) : resolve()));
+      }
+    }
   });
 
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
