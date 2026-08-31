@@ -11,39 +11,32 @@ const COMMAND_ENV_SECRET_ASSIGNMENT_RE = new RegExp(
   String.raw`(\b${SECRET_NAME_PATTERN}\s*=\s*)(?:(["'])([^"'` + "`" + String.raw`\r\n]*)\2|([^\s"'` + "`" + String.raw`]+))`,
   "gi",
 );
+// A resolved command can carry a credential under a provider-specific name that
+// does not match SECRET_NAME_PATTERN, so every shell-style NAME=value
+// assignment is redacted by default. Two guards keep the rule from eating
+// non-secret text:
+//   * The lookbehind `(?<![-\w])` anchors the name to a real word start, so a
+//     CLI flag such as `--mode=canary` or `--port=3100` is not an assignment
+//     and keeps its value.
+//   * COMMAND_ENV_ASSIGNMENT_ALLOWLIST carries the documented diagnostic
+//     fields that operators read out of the logs. Everything not listed here
+//     stays redacted, including assignments this codebase does not know yet.
+const COMMAND_ENV_ASSIGNMENT_ALLOWLIST: ReadonlySet<string> = new Set([
+  "status",
+  "latency_ms",
+  "attempt",
+]);
+const COMMAND_ENV_ASSIGNMENT_RE = new RegExp(
+  String.raw`(?<![-\w])([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(?:(["'])([^"'` + "`" + String.raw`\r\n]*)\3|([^\s"'` + "`" + String.raw`]+))`,
+  "g",
+);
 const COMMAND_AUTHORIZATION_BEARER_RE = /(\bAuthorization\s*:\s*Bearer\s+)[^\s"'`]+/gi;
 const COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}\b/g;
 const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g;
 const COMMAND_JWT_RE =
   /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b/g;
-const COMMAND_SECRET_HINTS = [
-  "api",
-  "key",
-  "token",
-  "auth",
-  "bearer",
-  "secret",
-  "pass",
-  "credential",
-  "jwt",
-  "private",
-  "cookie",
-  "connectionstring",
-  "sk-",
-  "ghp_",
-  "gho_",
-  "ghu_",
-  "ghs_",
-  "ghr_",
-] as const;
-
-function maybeContainsSecretText(command: string) {
-  const lower = command.toLowerCase();
-  return COMMAND_SECRET_HINTS.some((hint) => lower.includes(hint)) || command.includes(".");
-}
 
 export function redactCommandText(command: string, redactedValue = REDACTED_COMMAND_TEXT_VALUE): string {
-  if (!maybeContainsSecretText(command)) return command;
   return command
     .replace(COMMAND_AUTHORIZATION_BEARER_RE, `$1${redactedValue}`)
     .replace(COMMAND_CLI_SECRET_OPTION_RE, `$1${redactedValue}$3`)
@@ -51,6 +44,20 @@ export function redactCommandText(command: string, redactedValue = REDACTED_COMM
       COMMAND_ENV_SECRET_ASSIGNMENT_RE,
       (_match, prefix: string, quote: string | undefined) =>
         quote ? `${prefix}${quote}${redactedValue}${quote}` : `${prefix}${redactedValue}`,
+    )
+    .replace(
+      COMMAND_ENV_ASSIGNMENT_RE,
+      (
+        match: string,
+        name: string,
+        separator: string,
+        quote: string | undefined,
+      ) => {
+        if (COMMAND_ENV_ASSIGNMENT_ALLOWLIST.has(name.toLowerCase())) return match;
+        return quote
+          ? `${name}${separator}${quote}${redactedValue}${quote}`
+          : `${name}${separator}${redactedValue}`;
+      },
     )
     .replace(COMMAND_OPENAI_KEY_RE, redactedValue)
     .replace(COMMAND_GITHUB_TOKEN_RE, redactedValue)

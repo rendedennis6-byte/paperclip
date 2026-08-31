@@ -33,6 +33,45 @@ describe("redactDiagnosticText", () => {
     expect(output).toContain(REDACTED_COMMAND_TEXT_VALUE);
   });
 
+  it("redacts a provider-specific shell assignment without a secret-looking name", () => {
+    const output = redactDiagnosticText(
+      "env PROVIDER_SPECIFIC_BINDING=synthetic-provider-canary custom-acp",
+    );
+    expect(output).not.toContain("synthetic-provider-canary");
+    expect(output).toContain(`PROVIDER_SPECIFIC_BINDING=${REDACTED_COMMAND_TEXT_VALUE}`);
+  });
+
+  it("keeps CLI flag values intact because a flag is not a shell assignment", () => {
+    const input = "paperclip-runner --mode=canary --port=3100 --sandbox=none";
+    // The lookbehind anchors the assignment name to a word start, so the
+    // leading dashes keep these flags out of the assignment rule.
+    expect(redactDiagnosticText(input)).toBe(input);
+  });
+
+  it("keeps the allowlisted diagnostic fields readable", () => {
+    const input = "probe finished status=ok latency_ms=142 attempt=2";
+    expect(redactDiagnosticText(input)).toBe(input);
+  });
+
+  it("redacts an unknown assignment that sits next to allowlisted fields", () => {
+    const output = redactDiagnosticText(
+      "status=ok attempt=2 UPSTREAM_BINDING=synthetic-upstream-canary latency_ms=142",
+    );
+    expect(output).not.toContain("synthetic-upstream-canary");
+    expect(output).toContain(`UPSTREAM_BINDING=${REDACTED_COMMAND_TEXT_VALUE}`);
+    expect(output).toContain("status=ok");
+    expect(output).toContain("attempt=2");
+    expect(output).toContain("latency_ms=142");
+  });
+
+  it("redacts a quoted assignment value and keeps the quotes", () => {
+    const output = redactDiagnosticText(
+      "env CUSTOM_BINDING='synthetic quoted canary' custom-acp",
+    );
+    expect(output).not.toContain("synthetic quoted canary");
+    expect(output).toContain(`CUSTOM_BINDING='${REDACTED_COMMAND_TEXT_VALUE}'`);
+  });
+
   it("keeps non-secret text and non-secret JSON fields intact", () => {
     const input = '{"status":"ok","message":"probe finished"}';
     expect(redactDiagnosticText(input)).toBe(input);

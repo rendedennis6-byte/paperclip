@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import {
+  closeHttpServerWithDeadline,
   coordinateHeartbeatSchedulerShutdown,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
@@ -19,6 +20,133 @@ function deferred<T = void>() {
 function stubLogger() {
   return { info: vi.fn(), error: vi.fn() };
 }
+
+describe("closeHttpServerWithDeadline", () => {
+  it("reaps idle connections first and resolves once close settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      let finishClose: ((error?: Error) => void) | undefined;
+      const server = {
+        close: vi.fn((callback: (error?: Error) => void) => {
+          order.push("close");
+          finishClose = callback;
+        }),
+        closeIdleConnections: vi.fn(() => order.push("closeIdleConnections")),
+        closeAllConnections: vi.fn(() => order.push("closeAllConnections")),
+      };
+      const onTimeout = vi.fn();
+
+      const closing = closeHttpServerWithDeadline(server, 5_000, onTimeout);
+      // Idle sockets are reaped right after close() is armed. Active and
+      // upgraded sockets are left alone while the deadline still runs.
+      expect(order).toEqual(["close", "closeIdleConnections"]);
+
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(server.closeAllConnections).not.toHaveBeenCalled();
+      expect(onTimeout).not.toHaveBeenCalled();
+
+      finishClose?.();
+      await expect(closing).resolves.toBe(true);
+      // The close won the race, so nothing was ever forced.
+      expect(server.closeAllConnections).not.toHaveBeenCalled();
+      expect(onTimeout).not.toHaveBeenCalled();
+      // The deadline timer is cleared on the success path too.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("forces the remaining connections down only after the deadline expires", async () => {
+    vi.useFakeTimers();
+    try {
+      // close() never calls back: this models the upgraded socket that
+      // closeIdleConnections() cannot reap.
+      const server = {
+        close: vi.fn((_callback: (error?: Error) => void) => undefined),
+        closeIdleConnections: vi.fn(),
+        closeAllConnections: vi.fn(),
+      };
+      const onTimeout = vi.fn();
+
+      const closing = closeHttpServerWithDeadline(server, 5_000, onTimeout);
+      expect(server.closeIdleConnections).toHaveBeenCalledOnce();
+      expect(server.closeAllConnections).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      await expect(closing).resolves.toBe(false);
+      expect(server.closeAllConnections).toHaveBeenCalledOnce();
+      expect(onTimeout).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the deadline timer referenced while the close is pending", async () => {
+    // Real timers on purpose: the assertion is about the Timeout handle Node
+    // hands back, and an unref'd handle reports hasRef() === false.
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const server = {
+      close: vi.fn((_callback: (error?: Error) => void) => undefined),
+      closeIdleConnections: vi.fn(),
+      closeAllConnections: vi.fn(),
+    };
+
+    const closing = closeHttpServerWithDeadline(server, 20);
+    const timer = setTimeoutSpy.mock.results.at(-1)?.value as { hasRef?: () => boolean };
+    // An unref'd timer lets the event loop drain while close() is still
+    // pending, which is the exact hang this deadline exists to bound.
+    expect(timer?.hasRef?.()).toBe(true);
+
+    await expect(closing).resolves.toBe(false);
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("treats an already stopped listener as an idempotent success", async () => {
+    vi.useFakeTimers();
+    try {
+      const notRunning = Object.assign(new Error("Server is not running."), {
+        code: "ERR_SERVER_NOT_RUNNING",
+      });
+      const server = {
+        close: vi.fn((callback: (error?: Error) => void) => {
+          callback(notRunning);
+        }),
+        closeIdleConnections: vi.fn(),
+        closeAllConnections: vi.fn(),
+      };
+      const onTimeout = vi.fn();
+
+      await expect(closeHttpServerWithDeadline(server, 5_000, onTimeout)).resolves.toBe(true);
+      expect(onTimeout).not.toHaveBeenCalled();
+      // No deadline is left behind, so a repeated shutdown does not stall.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a genuine close failure without waiting for the deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const server = {
+        close: vi.fn((callback: (error?: Error) => void) => {
+          callback(new Error("close failed"));
+        }),
+        closeIdleConnections: vi.fn(),
+        closeAllConnections: vi.fn(),
+      };
+
+      await expect(closeHttpServerWithDeadline(server, 5_000)).resolves.toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("finalizeServerShutdown", () => {
   it("awaits the setup-token cleanup before the database stop and the process exit", async () => {

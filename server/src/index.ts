@@ -101,6 +101,7 @@ import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
 import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
 import {
+  closeHttpServerWithDeadline,
   coordinateHeartbeatSchedulerShutdown,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
@@ -1207,7 +1208,13 @@ export async function startServer(): Promise<StartedServer> {
       } catch (err) {
         logger.error({ err, signal }, "early post-listen run-log mirror flush failed");
       }
-      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      // A stuck client connection must not hold the early signal path open.
+      // The helper reaps idle sockets first and forces the rest only once the
+      // deadline expires.
+      const closed = await closeHttpServerWithDeadline(server, 5_000);
+      if (!closed) {
+        logger.warn({ signal }, "HTTP server did not close before shutdown deadline");
+      }
       const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
         ?.paperclipShutdown;
       const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
