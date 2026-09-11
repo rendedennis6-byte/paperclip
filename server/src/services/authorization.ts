@@ -292,7 +292,14 @@ function evaluateAuthorizationPolicyForAssignment(
     (Object.prototype.hasOwnProperty.call(policy, "agentVisibility") && !agentVisibility) ||
     (Object.prototype.hasOwnProperty.call(policy, "assignmentPolicy") && !assignmentPolicy) ||
     (Object.prototype.hasOwnProperty.call(policy, "protectedAgent") && !protectedAgent);
-  if (hasUnknownTopLevelKey || hasMalformedKnownSection) {
+  const hasSemanticPolicySection =
+    Boolean(agentVisibility || assignmentPolicy || protectedAgent) ||
+    Object.prototype.hasOwnProperty.call(policy, "trustPreset") ||
+    Object.prototype.hasOwnProperty.call(policy, "reviewPreset") ||
+    Object.prototype.hasOwnProperty.call(policy, "trustBoundary");
+  // `managedBy` is provenance metadata, not policy semantics. Preserve the
+  // previous fail-closed behavior when it is the only declared key.
+  if (hasUnknownTopLevelKey || hasMalformedKnownSection || !hasSemanticPolicySection) {
     return {
       kind: "unknown",
       explanation: `${label} has authorization policy data that core cannot evaluate for task assignment.`,

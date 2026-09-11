@@ -21,6 +21,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { authorizationService } from "../services/authorization.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
+import { assertLowTrustWorkspaceIsolation } from "../services/low-trust-runtime-containment.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1324,6 +1325,220 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.explanation).toContain("blocked by protected-agent policy");
   });
 
+  it("keeps managedBy-only authorization metadata fail-closed for assignment", async () => {
+    const company = await createCompany(db, "ManagedByOnlyAssignmentPolicy");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const targetAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        authorizationPolicy: {
+          managedBy: "permissions-extension",
+        },
+      },
+    });
+
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: targetAgent.id },
+      scope: { assigneeAgentId: targetAgent.id },
+    });
+
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_policy_restricted" });
+    expect(decision.explanation).toContain("cannot evaluate for task assignment");
+  });
+
+
+  // Regression cover for the two objections raised on the closed upstream PR
+  // paperclipai/paperclip#12996: that relaxing the assignment check for
+  // trust keys (a) is "trustPreset-only" and (b) leaves cross-boundary
+  // assignment unchecked. Both are answered by the runtime containment
+  // contract rather than by the assignment decision: assignability and
+  // containment are deliberately separate layers, and containment fails
+  // closed. These tests pin that separation so it cannot regress silently.
+  it("treats a trustPreset-only policy as assignable but keeps execution fail-closed without a boundary scope", async () => {
+    const company = await createCompany(db, "TrustPresetOnlyNoBoundary");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const targetAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        // Deliberately no trustBoundary: this is the "trustPreset-only" shape.
+        authorizationPolicy: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+        },
+      },
+    });
+
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: targetAgent.id },
+      scope: { assigneeAgentId: targetAgent.id },
+    });
+
+    // The assignment layer no longer misclassifies the policy as unevaluable...
+    expect(decision).toMatchObject({ allowed: true });
+
+    // ...but the trust resolver refuses to grant a low-trust identity without a
+    // concrete boundary, so nothing is actually containable-but-uncontained.
+    const resolution = resolveCoreTrustPreset({
+      companyId: company.id,
+      agent: { companyId: company.id, permissions: targetAgent.permissions },
+    });
+    expect(resolution).toMatchObject({
+      kind: "denied",
+      reason: "missing_low_trust_boundary_scope",
+    });
+
+    // And the runtime preflight turns that denial into a hard start failure.
+    await expect(assertLowTrustWorkspaceIsolation({
+      db,
+      resolution,
+      isolatedWorkspacesEnabled: true,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      selectedEnvironmentDriver: "sandbox",
+      issue: { companyId: company.id, id: randomUUID(), projectId: null },
+    })).rejects.toMatchObject({ status: 422, details: { code: "missing_low_trust_boundary_scope" } });
+
+    // Same contract for the adjacent shape: a trustBoundary that exists but
+    // declares no concrete scope. This exercises hasBoundaryScope() rather than
+    // the null-boundary short circuit above.
+    const emptyScopeAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET },
+        },
+      },
+    });
+    const emptyScopeResolution = resolveCoreTrustPreset({
+      companyId: company.id,
+      agent: { companyId: company.id, permissions: emptyScopeAgent.permissions },
+    });
+    expect(emptyScopeResolution).toMatchObject({
+      kind: "denied",
+      reason: "missing_low_trust_boundary_scope",
+    });
+    await expect(assertLowTrustWorkspaceIsolation({
+      db,
+      resolution: emptyScopeResolution,
+      isolatedWorkspacesEnabled: true,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      selectedEnvironmentDriver: "sandbox",
+      issue: { companyId: company.id, id: randomUUID(), projectId: null },
+    })).rejects.toMatchObject({ status: 422, details: { code: "missing_low_trust_boundary_scope" } });
+  });
+
+  it("contains a low-trust agent assigned across its trust boundary at run and access time", async () => {
+    const company = await createCompany(db, "CrossBoundaryAssignment");
+    const insideProject = await createProject(db, company.id, "InsideBoundary");
+    const outsideProject = await createProject(db, company.id, "OutsideBoundary");
+    const actorAgent = await createAgent(db, company.id, { role: "cto" });
+    const targetAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            projectIds: [insideProject.id],
+          },
+        },
+      },
+    });
+    const insideIssue = await createIssue(db, company.id, { projectId: insideProject.id });
+    const outsideIssue = await createIssue(db, company.id, { projectId: outsideProject.id });
+
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const authorization = authorizationService(db);
+
+    // A higher-trust actor may record the cross-boundary assignment: the
+    // assignment layer does not know about the target's boundary.
+    const assignDecision = await authorization.decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: outsideIssue.id,
+        projectId: outsideIssue.projectId,
+        assigneeAgentId: targetAgent.id,
+      },
+      scope: { assigneeAgentId: targetAgent.id },
+    });
+    expect(assignDecision).toMatchObject({ allowed: true });
+
+    const targetActor = {
+      type: "agent" as const,
+      agentId: targetAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+
+    // The assignment buys the low-trust agent nothing: every access to the
+    // out-of-boundary issue is denied, including the one it was assigned to.
+    for (const action of ["issue:read", "issue:mutate", "issue:comment"] as const) {
+      await expect(authorization.decide({
+        actor: targetActor,
+        action,
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: outsideIssue.id,
+          projectId: outsideIssue.projectId,
+          assigneeAgentId: targetAgent.id,
+          status: outsideIssue.status,
+        },
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+    }
+
+    // Positive control: the same agent still works normally inside its boundary.
+    await expect(authorization.decide({
+      actor: targetActor,
+      action: "issue:read",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: insideIssue.id,
+        projectId: insideIssue.projectId,
+        status: insideIssue.status,
+      },
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_low_trust_boundary" });
+
+    // The run cannot even start against the out-of-boundary issue.
+    const resolution = resolveCoreTrustPreset({
+      companyId: company.id,
+      agent: { companyId: company.id, permissions: targetAgent.permissions },
+    });
+    expect(resolution).toMatchObject({ kind: "low_trust_review" });
+    await expect(assertLowTrustWorkspaceIsolation({
+      db,
+      resolution,
+      isolatedWorkspacesEnabled: true,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      selectedEnvironmentDriver: "sandbox",
+      issue: { companyId: company.id, id: outsideIssue.id, projectId: outsideIssue.projectId },
+    })).rejects.toMatchObject({ status: 422, details: { code: "low_trust_boundary_mismatch" } });
+
+    // ...while the in-boundary issue passes the same preflight.
+    await expect(assertLowTrustWorkspaceIsolation({
+      db,
+      resolution,
+      isolatedWorkspacesEnabled: true,
+      effectiveExecutionWorkspaceMode: "isolated_workspace",
+      selectedEnvironmentDriver: "sandbox",
+      issue: { companyId: company.id, id: insideIssue.id, projectId: insideIssue.projectId },
+    })).resolves.toBeUndefined();
+  });
   it("requires an explicit grant before assigning to a private target agent", async () => {
     const company = await createCompany(db, "PrivateAssignment");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });
