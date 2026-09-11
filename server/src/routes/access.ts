@@ -1269,7 +1269,11 @@ async function getProtectedMemberReason(
     operation?: "archive" | "update";
   },
 ): Promise<string | null> {
-  if (member.principalType !== "user") return "Only human company members can be removed.";
+  if (member.principalType !== "user") {
+    return opts?.operation === "archive"
+      ? "Only human company members can be removed."
+      : null;
+  }
   if (req.actor.type !== "board") return "Board access is required to remove members.";
   if (member.principalId === req.actor.userId) return "You cannot remove yourself.";
   const isTargetInstanceAdmin = opts?.instanceAdminUserIds
@@ -4744,6 +4748,17 @@ export function accessRoutes(
           grantCount: req.body.grants?.length ?? 0,
         },
       });
+      if (updated.principalType !== "user") {
+        // Non-user memberships are always agents (PrincipalType is "user" | "agent");
+        // pass the "agent" literal so listPrincipalGrants receives PrincipalType, not string.
+        const grants = await access.listPrincipalGrants(
+          companyId,
+          "agent",
+          updated.principalId,
+        );
+        res.json({ ...updated, grants });
+        return;
+      }
       const member = (await loadCompanyMemberRecords(db, companyId)).find(
         (entry) => entry.id === memberId,
       );
