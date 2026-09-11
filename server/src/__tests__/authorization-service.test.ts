@@ -20,6 +20,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { authorizationService } from "../services/authorization.js";
+import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1215,6 +1216,112 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.explanation).toContain("assignment is blocked");
     expect(decision.explanation).toContain("company administrator");
     expect(decision.explanation).not.toContain("approval");
+  });
+
+  it("allows assigning a low-trust-review agent whose authorizationPolicy declares trustPreset and trustBoundary", async () => {
+    const company = await createCompany(db, "LowTrustReviewAssignable");
+    const project = await createProject(db, company.id, "Boundary");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: actorAgent.id,
+      status: "active",
+      membershipRole: "member",
+    });
+    const targetAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            projectIds: [project.id],
+          },
+        },
+      },
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: targetAgent.id },
+      scope: { assigneeAgentId: targetAgent.id },
+    });
+
+    expect(decision.allowed).toBe(true);
+    expect(decision.reason).not.toBe("deny_policy_restricted");
+
+    const resolution = resolveCoreTrustPreset({
+      companyId: company.id,
+      agent: { companyId: company.id, permissions: targetAgent.permissions },
+    });
+    expect(resolution).toMatchObject({
+      kind: "low_trust_review",
+      preset: LOW_TRUST_REVIEW_PRESET,
+      boundary: { projectIds: [project.id] },
+    });
+  });
+
+  it("still denies assignment when an authorization policy carries a genuinely unknown top-level key", async () => {
+    const company = await createCompany(db, "UnknownAssignmentPolicyKey");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const targetAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        authorizationPolicy: {
+          bogusKey: { anything: true },
+        },
+      },
+    });
+
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: targetAgent.id },
+      scope: { assigneeAgentId: targetAgent.id },
+    });
+
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_policy_restricted" });
+    expect(decision.explanation).toContain("cannot evaluate for task assignment");
+  });
+
+  it("keeps protectedAgent.blockAssignment as a hard block even alongside trustPreset/trustBoundary", async () => {
+    const company = await createCompany(db, "ProtectedLowTrustAssignment");
+    const project = await createProject(db, company.id, "Boundary");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const targetAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            projectIds: [project.id],
+          },
+          protectedAgent: {
+            blockAssignment: true,
+            blockReason: "Under review",
+          },
+        },
+      },
+    });
+
+    await grantAgentPermission(db, company.id, actorAgent.id, "tasks:assign");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: targetAgent.id },
+      scope: { assigneeAgentId: targetAgent.id },
+    });
+
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_policy_restricted" });
+    expect(decision.explanation).toContain("blocked by protected-agent policy");
   });
 
   it("requires an explicit grant before assigning to a private target agent", async () => {

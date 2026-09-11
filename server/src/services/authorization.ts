@@ -276,10 +276,23 @@ function evaluateAuthorizationPolicyForAssignment(
     "assignmentPolicy",
     "protectedAgent",
     "managedBy",
+    // Trust-preset/boundary keys govern the low-trust runtime containment
+    // (resolveCoreTrustPreset / isIssueWithinLowTrustBoundary), not task
+    // assignability. They are schema-declared in trustAuthorizationPolicySchema
+    // but semantically irrelevant here, so they are known-and-ignored rather
+    // than treated as unevaluable policy data.
+    "trustPreset",
+    "reviewPreset",
+    "trustBoundary",
   ]);
   const hasUnknownTopLevelKey = Object.keys(policy).some((key) => !knownTopLevelKeys.has(key));
-  const hasKnownPolicySection = Boolean(agentVisibility || assignmentPolicy || protectedAgent);
-  if (hasUnknownTopLevelKey || !hasKnownPolicySection) {
+  // A recognized top-level key whose value isn't the expected object shape is
+  // malformed, not merely ignorable — fail closed on it like an unknown key.
+  const hasMalformedKnownSection =
+    (Object.prototype.hasOwnProperty.call(policy, "agentVisibility") && !agentVisibility) ||
+    (Object.prototype.hasOwnProperty.call(policy, "assignmentPolicy") && !assignmentPolicy) ||
+    (Object.prototype.hasOwnProperty.call(policy, "protectedAgent") && !protectedAgent);
+  if (hasUnknownTopLevelKey || hasMalformedKnownSection) {
     return {
       kind: "unknown",
       explanation: `${label} has authorization policy data that core cannot evaluate for task assignment.`,
